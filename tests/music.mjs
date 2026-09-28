@@ -256,6 +256,21 @@ const SCENARIOS = [
       let n = 0; row.querySelectorAll('a').forEach(a => a.addEventListener('click', e => { n++; e.preventDefault(); }));
       touch(w, row.querySelector('.title'), 50, 400);
       await sleep(1200); return n ? '跳到专辑 / 歌手页' : '没跳转'; } },
+  { name: '查看评论时点评论（展开全文），不会跳转', expect: '没跳转', run: async (w, v) => {
+      const sec = w.document.createElement('ytmusic-comment-section-renderer');
+      sec.innerHTML = '<div role="listitem" class="comment-thread"><a href="/channel/UCuser">@某人</a>' +
+        '<a href="/watch?v=abc&lc=xyz">2 天前</a><div class="content">很长的评论…… 展开</div></div>';
+      w.document.body.appendChild(sec);
+      let n = 0; sec.querySelectorAll('a').forEach(a => a.addEventListener('click', e => { n++; e.preventDefault(); }));
+      touch(w, sec.querySelector('.content'), 60, 500);
+      await sleep(1200); return n ? '跳转了' : '没跳转'; } },
+  { name: '其他 role=listitem 的列表项不补点', expect: '没跳转', run: async (w, v) => {
+      const li = w.document.createElement('div'); li.setAttribute('role', 'listitem');
+      li.innerHTML = '<a href="/browse/MPREx">专辑</a><span class="t">文字</span>';
+      w.document.body.appendChild(li);
+      let n = 0; li.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
+      touch(w, li.querySelector('.t'), 60, 500);
+      await sleep(1200); return n ? '跳转了' : '没跳转'; } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';

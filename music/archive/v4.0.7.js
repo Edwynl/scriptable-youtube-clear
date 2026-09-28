@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.8-scriptable';
+const VERSION = '4.0.7-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -897,7 +897,6 @@ const magicScript = `
     // 滑动列表后松手、长按：不是点击，不补点
     // （v4.0.0 起补点在播放中也会触发，滑动时松手停在某一行上就会被“补点”，跳到专辑页、打断正在放的歌）
     if (!wasCleanTap()) return;
-    if (target.closest && target.closest(NO_FALLBACK_SEL)) return;   // 评论区、弹窗、标签栏
     // 只对歌曲 / 歌单卡片补点。普通按钮（播放、暂停、喜欢、标签页）点了不会跳转，
     // 如果也补点，会把刚才的操作再做一次（例如刚暂停又被点回播放）
     var item = closestMusicItem(target);
@@ -948,20 +947,16 @@ const magicScript = `
     return null;
   }
 
-  // 只对歌曲行、歌单 / 专辑卡片补点。
-  // 旧版还包括所有 [role="listitem"]，评论也属于这一类：点评论（展开全文）不会跳转，
-  // 补点就会点到评论者主页或评论时间链接，跳到别的页面、切掉正在放的歌
   var MUSIC_ITEM_SEL = [
     'ytmusic-responsive-list-item-renderer',
-    'ytmusic-two-row-item-renderer'
-  ].join(',');
-
-  // 这些区域里的点击一律不补点
-  var NO_FALLBACK_SEL = [
-    'ytd-comments', 'ytd-comment-thread-renderer', 'ytd-comment-renderer', 'ytd-comment-view-model',
-    'ytm-comment-thread-renderer', 'ytm-comment-renderer', 'ytmusic-comment-section-renderer',
-    '#comments', '[id*="comment"]', '[class*="comment"]',
-    'ytmusic-player-page tp-yt-paper-tabs', 'tp-yt-paper-dialog', 'ytmusic-menu-popup-renderer'
+    'ytmusic-two-row-item-renderer',
+    'ytmusic-carousel-shelf-basic-header-renderer',
+    'ytmusic-grid-renderer ytmusic-card-shelf-renderer',
+    'ytmusic-card-shelf-renderer',
+    'ytmusic-playlist-shelf-renderer ytmusic-responsive-list-item-renderer',
+    '[role="listitem"]',
+    '[data-testid*="song"]',
+    '[data-testid*="playlist"]'
   ].join(',');
 
   function closestMusicItem(node) {
@@ -1010,8 +1005,7 @@ const magicScript = `
       return item.querySelector('a[href*="watch"]') ||
              item.querySelector('ytmusic-play-button-renderer, .play-button, #play-button') || null;
     }
-    // 卡片：点封面 / 标题的主链接
-    return item.querySelector('a.yt-simple-endpoint[href], a.thumbnail[href]') || findItemAction(item) || null;
+    return findItemAction(item) || item;
   }
 
   function findItemAction(item) {
