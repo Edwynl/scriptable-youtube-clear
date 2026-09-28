@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.8.4-scriptable';
+const VERSION = '1.8.3-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -142,9 +142,7 @@ const magicScript = `
     resumeAfterInterruption: false,
     userPausedReason: '',
     pipYield: false,           // 画中画里被网页外部暂停（微信语音 / 小窗暂停键）：只有用户亲手播放才继续
-    pipYieldLogged: false,
-    lastPipPauseAt: 0,         // 画中画里最近一次被暂停的时间（用于记录系统自动恢复）
-    lastPagePlayAt: 0,         // 网页最近一次调用 play() 的时间             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
+    pipYieldLogged: false,             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
 
     debugTaps: [],
     logs: []
@@ -693,7 +691,7 @@ const magicScript = `
     if (!ctx) return;
     log('audio ' + ctx.state);
     if (ctx.state === 'interrupted') beginInterruption('audio session');
-    else if (ctx.state === 'running' && state.interrupted) endInterruption('audio running');
+    else if (state.interrupted) endInterruption('audio ' + ctx.state);
   }
 
   function isWindowLevelEvent(event) {
@@ -909,7 +907,6 @@ const magicScript = `
           if (!state.pipYieldLogged) { log('page play() blocked (PiP paused outside page)'); state.pipYieldLogged = true; }
           return Promise.resolve();
         }
-        state.lastPagePlayAt = Date.now();
         if (hidden || isInPiP(this)) log('page play()' + (isInPiP(this) ? ' in PiP' : ' in background'));
         clearUserPaused();
         startAudioKeepAlive();   // 在用户手势的调用栈里启动，iOS 才允许
@@ -1028,10 +1025,6 @@ const magicScript = `
 
     if (mode === 'picture-in-picture') {
       state.pipSince = Date.now();
-      if (state.keepAliveOsc || (state.audioCtx && state.audioCtx.state === 'running')) {
-        stopAudioKeepAlive();
-        log('keep-alive stopped (PiP keeps playback alive)');
-      }
       // 全屏 → 画中画的切换过程中出现的暂停，不是用户点的 → 撤销并恢复
       if (state.fgPauseAt && state.fgPauseNative && Date.now() - state.fgPauseAt < BG_PAUSE_GRACE) {
         log('pause was part of PiP transition -> revert');
@@ -1044,7 +1037,6 @@ const magicScript = `
       state.pipSince = 0;
       state.pipYield = false;
       state.lastPipEndAt = Date.now();
-      if (v && !v.paused) startAudioKeepAlive();
     }
   }
 
@@ -1069,14 +1061,7 @@ const magicScript = `
     }
   }
 
-  function onVideoPlaying(event) {
-    var now = Date.now();
-    if (state.lastPipPauseAt && now - state.lastPipPauseAt < 5000 && (!event || event.type === 'play')) {
-      log('PiP resumed ' + (now - state.lastPipPauseAt) + 'ms after pause by ' +
-        (now - state.lastPagePlayAt < 300 ? 'page' : 'system/user') +
-        ' (audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ')');
-      state.lastPipPauseAt = 0;
-    }
+  function onVideoPlaying() {
     log('playing');
     state.pipYield = false;
     if (state.interrupted) { state.interrupted = false; state.resumeAfterInterruption = false; log('interruption ended: playing'); }
@@ -1118,7 +1103,6 @@ const magicScript = `
         // 画中画里被暂停（小窗暂停键、微信语音……）：让出播放，不许 YouTube 自己恢复
         state.pipYield = true;
         state.pipYieldLogged = false;
-        state.lastPipPauseAt = Date.now();
         if (state.interrupted) { updateMediaSession(); return; }
         setUserPaused('picture-in-picture');
         updateMediaSession();
@@ -1443,9 +1427,6 @@ const magicScript = `
       try { listen(state.audioCtx, 'statechange', onAudioStateChange); } catch (e) {}
     }
     if (state.interrupted) return;   // 被打断时不抢音频会话
-    // 画中画本身就能让视频在后台继续播放，不需要保活音频；
-    // 保活音频占着音频会话，会让 iOS 以为微信语音的打断很快结束，0.9 秒后就把视频恢复
-    if (isInPiP(state.video || findVideo())) return;
     if (state.audioCtx.state !== 'running') {
       try {
         var p = state.audioCtx.resume();

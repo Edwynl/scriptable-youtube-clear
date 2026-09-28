@@ -223,6 +223,16 @@ const SCENARIOS = [
   { group: '画中画', name: '刚进画中画就在锁屏点暂停', expect: '暂停', run: async (w, v) => {
       A.toPiP(w, v, false); A.lock(w); await sleep(300);
       w.__handlers.pause && w.__handlers.pause(); await sleep(1500); return state(v); } },
+  { group: '画中画', name: '进入画中画后停掉保活音频', expect: '已停止', run: async (w, v) => {
+      await sleep(300); A.toPiP(w, v, false); await sleep(800);
+      const c = ctxOf(w); return c && c.state === 'running' ? '仍在运行' : '已停止'; } },
+  { group: '画中画', name: '第一条语音结束、画中画里恢复播放时，不重启保活音频', expect: '已停止', run: async (w, v) => {
+      await sleep(300); A.toPiP(w, v, false); await sleep(2500);
+      A.sysPause(w, v); await sleep(3000); A.sysPlay(w, v); await sleep(2500);
+      const c = ctxOf(w); return c && c.state === 'running' ? '仍在运行' : '已停止'; } },
+  { group: '画中画', name: '离开画中画后恢复保活音频', expect: '运行中', run: async (w, v) => {
+      await sleep(300); A.toPiP(w, v, false); await sleep(800); A.pipBackInline(w, v); await sleep(800);
+      const c = ctxOf(w); return c && c.state === 'running' ? '运行中' : '未运行'; } },
   { group: '画中画', name: '去掉 YouTube 加的 disablepictureinpicture', expect: '已移除', run: async (w, v) => {
       v.setAttribute('disablepictureinpicture', ''); await sleep(1000);
       return v.hasAttribute('disablepictureinpicture') ? '仍存在' : '已移除'; } },
