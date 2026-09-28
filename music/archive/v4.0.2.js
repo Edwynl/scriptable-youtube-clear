@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.3-scriptable';
+const VERSION = '4.0.2-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -135,7 +135,6 @@ const magicScript = `
     pendingUnmute: false,
 
     lastTapPoint: null,
-    lastMediaEventAt: 0,       // 最近一次播放 / 暂停 / 切歌事件（判断点击有没有生效）
     lastPromptScan: 0,
     lastDialogCheck: 0,
 
@@ -358,7 +357,6 @@ const magicScript = `
     var prev = state.sessionState;
     var now = audioSessionState();
     state.sessionState = now;
-    if (!prev && !now) { log('audioSession event (state not supported)'); return; }
     log('audioSession ' + prev + ' -> ' + now);
     if (now === 'interrupted') beginInterruption('audioSession');
     // 只认“从 interrupted 离开”才是结束；刚被打断时会话变成 inactive 不算
@@ -399,13 +397,6 @@ const magicScript = `
   function onAudioStateChange() {
     var ctx = state.audioCtx;
     if (!ctx) return;
-    var v = state.video;
-    // 真机日志：切到后台那一刻、以及系统刚恢复音乐时，保活音频都会被标成 interrupted，
-    // 但音乐还在放 —— 这不是被别的 App 打断，不能据此停掉恢复逻辑
-    if (ctx.state === 'interrupted' && v && !v.paused) {
-      log('audio interrupted while music playing -> ignored (backgrounding)');
-      return;
-    }
     log('audio ' + ctx.state);
     if (ctx.state === 'interrupted') beginInterruption('audio session');
     else if (ctx.state === 'running' && state.interrupted) endInterruption('audio running');
@@ -783,20 +774,13 @@ const magicScript = `
     }
 
     if (event.type !== 'touchend' && event.type !== 'pointerup') return;
-    // 只对歌曲 / 歌单卡片补点。普通按钮（播放、暂停、喜欢、标签页）点了不会跳转，
-    // 如果也补点，会把刚才的操作再做一次（例如刚暂停又被点回播放）
-    var item = closestMusicItem(target);
+    var item = closestMusicItem(target) || nearestActionContainer(target);
     if (!item || item.__ytClearTapFixUntil > Date.now()) return;
-    var innerButton = target.closest && target.closest(
-      'button, tp-yt-paper-icon-button, yt-button-renderer, ytmusic-menu-renderer, ytmusic-like-button-renderer, ytmusic-toggle-button-renderer');
-    if (innerButton && innerButton !== item && item.contains(innerButton)) return;   // 点的是卡片里的按钮（喜欢、菜单……）
 
     var before = samePageState();
-    var tappedAt = Date.now();
-    item.__ytClearTapFixUntil = tappedAt + TAP_FALLBACK_DELAY + 700;
+    item.__ytClearTapFixUntil = Date.now() + TAP_FALLBACK_DELAY + 700;
     setTimeout(function () {
       if (!document.contains(item) || samePageState() !== before) return;
-      if (state.lastMediaEventAt > tappedAt) return;   // 已经开始播放 / 切歌，说明点击生效了
       var action = findItemAction(item) || item;
       if (!action || isPlayerControlTap(action)) return;
       log('tap fallback: ' + item.tagName.toLowerCase());
@@ -1025,7 +1009,6 @@ const magicScript = `
 
   function onVideoPlaying() {
     log('playing');
-    state.lastMediaEventAt = Date.now();
     if (state.interrupted) {
       state.interrupted = false;
       state.resumeAfterInterruption = false;
@@ -1062,17 +1045,10 @@ const magicScript = `
   function onVideoPause(event) {
     var video = (event && event.target) || getVideo();
     state.playingSince = 0;
-    state.lastMediaEventAt = Date.now();
-    if (!video || video.ended || isNearEnd(video)) { log('pause: track end'); applyKeepAlivePolicy('track end'); return; }  // 一首播完，交给 YT Music 切歌
-    if (state.inAd) { log('pause: ad'); return; }
-    if (Date.now() < state.transitionUntil) { log('pause: transition'); return; }
-    if (state.userPaused || state.interrupted) {
-      log('pause: ' + (state.interrupted ? 'while interrupted' : 'user paused (' + state.userPausedReason + ')'));
-      updateMediaSession();
-      applyKeepAlivePolicy('pause');
-      return;
-    }
-    var ctxInterrupted = !!(state.audioCtx && state.audioCtx.state === 'interrupted');
+    if (!video || video.ended || isNearEnd(video)) { applyKeepAlivePolicy('track end'); return; }  // 一首播完，交给 YT Music 切歌
+    if (state.inAd) return;
+    if (Date.now() < state.transitionUntil) return;
+    if (state.userPaused || state.interrupted) { updateMediaSession(); applyKeepAlivePolicy('pause'); return; }
 
     // 1) 原生全屏 / 画中画里：网页收不到触摸，暂停来自系统控件
     if (inNativePlayer(video)) {
@@ -1081,15 +1057,8 @@ const magicScript = `
       return;
     }
 
-    // 2) 前台、非手势
+    // 2) 前台、非手势：拔耳机、来电、YT Music 自己暂停……尊重它
     if (!isBackground()) {
-      // 保活音频同时被打断 → 来电等真正的打断：挂断后自动继续
-      if (ctxInterrupted) {
-        beginInterruption('pause + audio interrupted (foreground)');
-        updateMediaSession();
-        return;
-      }
-      // 否则：拔耳机、YT Music 自己暂停……尊重它
       acceptForegroundPause('system (foreground)', false);
       updateMediaSession();
       applyKeepAlivePolicy('pause');
@@ -1120,7 +1089,6 @@ const magicScript = `
   }
 
   function onVideoLoadStart() {
-    state.lastMediaEventAt = Date.now();
     markTransition();
     onVideoGap();
   }

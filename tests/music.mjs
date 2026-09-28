@@ -166,6 +166,38 @@ const SCENARIOS = [
       A.blur(w); await sleep(2500); A.sysPause(w, v); await sleep(4800);
       const logs = (w.__ytClearScriptableMusic && w.__ytClearScriptableMusic.logs) || [];
       return logs.some(l => l.indexOf('still interrupted') >= 0) ? '有' : '无'; } },
+  { name: '真机日志复现：切后台时保活音频被标 interrupted，不当成被打断', expect: '播放，未误判', run: async (w, v) => {
+      A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
+      setAudio(w, 'interrupted');                                   // 切后台那一刻（音乐还在放）
+      await sleep(6000);
+      A.sysPause(w, v); await sleep(3000);                          // 微信语音
+      A.sysPlay(w, v); await sleep(20); setAudio(w, 'interrupted'); // 语音结束，系统恢复；随即又被标 interrupted
+      await sleep(1500);
+      const s = w.__ytClearScriptableMusic.state;
+      return st(v) + '，' + (s.interrupted ? '误判为打断' : '未误判'); } },
+  { name: '真机日志复现：系统恢复后再听第二条语音，结束后仍自动继续', expect: '暂停，抢 0 次→播放', run: async (w, v) => {
+      A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
+      setAudio(w, 'interrupted'); await sleep(6000);
+      A.sysPause(w, v); await sleep(2500); A.sysPlay(w, v); await sleep(20); setAudio(w, 'interrupted'); await sleep(2000);
+      const r = await interruptFor(w, v, 2500, false);             // 第二条语音
+      A.sysPlay(w, v); await sleep(1500);                           // 系统恢复
+      return grabText(r) + '→' + st(v); } },
+  { name: '前台来电：先报 audio interrupted 再暂停，挂断后继续', expect: '暂停→播放', run: async (w, v) => {
+      setAudio(w, 'interrupted'); await sleep(50); A.sysPause(w, v); await sleep(2000);
+      const mid = st(v); setAudio(w, 'running'); await sleep(2000); return mid + '→' + st(v); } },
+  { name: '点播放页里的按钮（喜欢 / 暂停）不会被补点第二次', expect: '1 次', run: async (w, v) => {
+      const page = w.document.createElement('ytmusic-player-page');
+      page.innerHTML = '<ytmusic-like-button-renderer><button aria-label="Like">👍</button></ytmusic-like-button-renderer>';
+      w.document.body.appendChild(page);
+      const b = page.querySelector('button'); let n = 0; b.addEventListener('click', () => n++);
+      b.dispatchEvent(new w.Event('touchend', { bubbles: true })); b.click(); await sleep(1000); return n + ' 次'; } },
+  { name: '列表里的歌曲卡片点了没反应时，补点一次', expect: '补点 1 次', run: async (w, v) => {
+      const item = w.document.createElement('ytmusic-two-row-item-renderer');
+      item.innerHTML = '<a class="thumb" href="/playlist?list=PL1"></a><div class="title">歌单</div>';
+      w.document.body.appendChild(item);
+      let n = 0; item.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
+      item.querySelector('.title').dispatchEvent(new w.Event('touchend', { bubbles: true })); await sleep(1000);
+      return '补点 ' + n + ' 次'; } },
   { name: '锁屏“下一首”只切一首', expect: '1 次', run: async (w, v) => {
       let n = 0; w.document.querySelector('.next-button').addEventListener('click', () => n++);
       await sleep(300); w.__handlers.nexttrack && w.__handlers.nexttrack(); await sleep(300); return n + ' 次'; } },
