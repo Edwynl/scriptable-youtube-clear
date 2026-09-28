@@ -245,6 +245,21 @@ const SCENARIOS = [
       const r = await interruptFor(w, v, 2000);
       w.__fakeHidden = false; w.document.dispatchEvent(new w.Event('visibilitychange')); await sleep(2000);
       return (r.paused ? '暂停' : '播放') + '→' + state(v); } },
+  { group: '被打断', name: '连续听两条微信语音（中间页面被系统唤醒）', expect: '暂停，抢 0 次→播放', run: async (w, v) => {
+      A.lock(w); await sleep(2000);
+      await interruptFor(w, v, 1000); setAudio(w, 'running'); await sleep(1500);   // 第一条
+      // 视频恢复播放时，系统唤醒后台页面：发出 resume / focus，但页面仍在后台
+      w.document.dispatchEvent(new w.Event('resume')); w.dispatchEvent(new w.FocusEvent('focus')); await sleep(300);
+      const r = await interruptFor(w, v, 2000);                                     // 第二条
+      setAudio(w, 'running'); await sleep(2000);
+      return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次→' + state(v); } },
+  { group: '被打断', name: '连续听两条微信语音（画中画）', expect: '暂停，抢 0 次→播放', run: async (w, v) => {
+      A.toPiP(w, v, false); A.lock(w); await sleep(2500);
+      await interruptFor(w, v, 1000); setAudio(w, 'running'); await sleep(1500);
+      w.document.dispatchEvent(new w.Event('resume')); w.dispatchEvent(new w.FocusEvent('focus')); await sleep(2500);
+      const r = await interruptFor(w, v, 2000);
+      setAudio(w, 'running'); await sleep(2000);
+      return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次→' + state(v); } },
   { group: '被打断', name: '后台拔耳机（没有打断信号）：保持暂停', expect: '暂停', run: async (w, v) => {
       A.lock(w); await sleep(2000); A.sysPause(w, v); await sleep(2500); return state(v); } },
   { group: '其他', name: '首页横屏不全屏（预览视频）', url: 'https://m.youtube.com/', expect: '0 次', run: async (w, v) => {

@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.8.1-scriptable';
+const VERSION = '1.8.0-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -761,12 +761,6 @@ const magicScript = `
 
   function onForeground(event) {
     if (!isWindowLevelEvent(event)) return;
-    // 页面在后台被系统唤醒时也会发 resume / focus / pageshow，
-    // 这不是回到 App —— 当成回到前台会打断微信语音
-    if (isReallyHidden()) {
-      log('fg ' + ((event && event.type) || '') + ' ignored (still hidden)');
-      return;
-    }
     log('fg' + (event && event.type ? ' ' + event.type : ''));
     state.realBackgrounded = false;
     state.hiddenSince = 0;
@@ -1581,17 +1575,7 @@ const magicScript = `
      广告或切换视频时 120ms 一次，平时 700ms 一次
      ══════════════════════════════════════════════════════════ */
 
-  // 按页面真实可见性记录“进入后台多久了”，不依赖容易误发的事件
-  function trackHidden() {
-    if (isReallyHidden()) {
-      if (!state.hiddenSince) state.hiddenSince = Date.now();
-    } else if (state.hiddenSince) {
-      state.hiddenSince = 0;
-    }
-  }
-
   function mediaTick() {
-    trackHidden();
     ensureStyle();
     ensureUI();
     getVideo();
