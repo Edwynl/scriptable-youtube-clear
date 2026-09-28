@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.4-scriptable';
+const VERSION = '4.0.3-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -82,7 +82,6 @@ const magicScript = `
   var TAP_FALLBACK_DELAY = 450;              // 点了列表项多久没反应，才补点一次
   var INTERRUPT_BEAT = 4000;                 // 打断期间多久记一次心跳 / 检查一次是否结束
   var RESUME_PROTECT = 3000;                 // 打断结束恢复播放后，这么久内不让 YT Music 自己再暂停
-  var AUDIO_RECOVERY_WINDOW = 30000;         // 系统恢复播放后，最多这么久内反复尝试把声音接回来
 
   var state = {
     loopTimer: null,
@@ -130,10 +129,6 @@ const magicScript = `
     interruptBeat: null,
     sessionState: '',          // navigator.audioSession 上一次的状态
     protectPlayUntil: 0,
-    recoverUntil: 0,           // 正在把声音接回来（系统恢复了播放但音频会话没恢复）
-    recoverStartedAt: 0,
-    recoverTimer: null,
-    lastLinkTapAt: 0,
 
     mediaSessionBound: false,
     lastMediaSessionRefresh: 0,
@@ -319,7 +314,6 @@ const magicScript = `
         ' [audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ' session=' + (audioSessionState() || '-') + ']');
       startInterruptBeat();
     }
-    stopAudioRecovery('');
     state.shouldResume = false;
     applyKeepAlivePolicy('interrupted');
   }
@@ -371,47 +365,6 @@ const magicScript = `
     else if (prev === 'interrupted' && state.interrupted) endInterruption('audioSession ' + now);
   }
 
-  /* ─── 把声音接回来 ───
-     真机日志：语音结束后系统会把音乐恢复成“播放中”，但 App 在后台时音频会话常常没能重新激活
-     （保活音频随即又变成 interrupted），结果是无声播放，回到 App 才有声音。
-     所以系统恢复后，每秒尝试一次重新激活音频会话（保活音频进入 running 即成功），最多 30 秒。
-     只在语音已经结束（系统已恢复播放）之后才做，不会在语音期间抢声音。 */
-  function startAudioRecovery(reason) {
-    var now = Date.now();
-    state.recoverUntil = now + AUDIO_RECOVERY_WINDOW;
-    state.recoverStartedAt = now;
-    log('audio recovery start (' + reason + ')');
-    if (state.recoverTimer) clearInterval(state.recoverTimer);
-    var attempts = 0;
-    var step = function () {
-      var t = Date.now();
-      var v = state.video;
-      var ctx = state.audioCtx;
-      if (state.interrupted || state.userPaused) { stopAudioRecovery('stopped: ' + (state.interrupted ? 'interrupted again' : 'user paused')); return; }
-      if (t > state.recoverUntil) { stopAudioRecovery('gave up after ' + attempts + ' tries'); return; }
-      if (ctx && ctx.state === 'running' && attempts > 0) {
-        log('audio restored after ' + ((t - state.recoverStartedAt) / 1000).toFixed(1) + 's (' + attempts + ' tries, video ' + (v && !v.paused ? 'playing' : 'paused') + ')');
-        if (v && v.paused && !v.ended) attemptPlay(v);
-        stopAudioRecovery('');
-        return;
-      }
-      attempts++;
-      startAudioKeepAlive();
-      if (ctx && ctx.state !== 'running') {
-        try { var p = ctx.resume(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
-      }
-      if (attempts % 5 === 0) log('audio recovery: try ' + attempts + ' [audio=' + (ctx ? ctx.state : '-') + ' video=' + (v && !v.paused ? 'playing' : 'paused') + ']');
-    };
-    state.recoverTimer = setInterval(step, 1000);
-    setTimeout(step, 150);
-  }
-
-  function stopAudioRecovery(msg) {
-    if (state.recoverTimer) { clearInterval(state.recoverTimer); state.recoverTimer = null; }
-    state.recoverUntil = 0;
-    if (msg) log('audio recovery ' + msg);
-  }
-
   // 恢复播放：通过 YT Music 自己的 playVideo，播放器界面和状态才会同步（否则它可能马上又暂停）
   function resumeAfterInterruptionNow(reason) {
     var p = getPlayer();
@@ -419,7 +372,6 @@ const magicScript = `
     log('resume after interruption (' + reason + ')');
     state.protectPlayUntil = Date.now() + RESUME_PROTECT;
     // 对方已经交还声音：先把保活音频接回来（重新激活音频会话），后台才允许开始播放
-    if (isBackground()) startAudioRecovery(reason);
     applyKeepAlivePolicy('resume');
     try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
     softResume(400);
@@ -540,7 +492,6 @@ const magicScript = `
     state.realBackgrounded = false;
     state.bgSince = 0;
     state.hiddenSince = 0;
-    if (state.recoverUntil) stopAudioRecovery('ended: back to app');
     endInterruption('back to app');
     applyKeepAlivePolicy('fg');
     rebindMediaSession();
@@ -826,7 +777,6 @@ const magicScript = `
       }
       if (web) {
         log('tap web link: ' + href.slice(0, 80));
-        state.lastLinkTapAt = Date.now();
         prepareNavigation(web);
         return;
       }
@@ -847,7 +797,6 @@ const magicScript = `
     setTimeout(function () {
       if (!document.contains(item) || samePageState() !== before) return;
       if (state.lastMediaEventAt > tappedAt) return;   // 已经开始播放 / 切歌，说明点击生效了
-      if (state.lastLinkTapAt > tappedAt - 1000) return; // 同一次点击已经点到了链接
       var action = findItemAction(item) || item;
       if (!action || isPlayerControlTap(action)) return;
       log('tap fallback: ' + item.tagName.toLowerCase());
@@ -1087,7 +1036,6 @@ const magicScript = `
       var p = getPlayer();
       var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
       try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
-      if (isBackground()) startAudioRecovery('system resume');
     }
     if (!state.playingSince) state.playingSince = Date.now();
     state.transitionUntil = 0;
@@ -1473,7 +1421,6 @@ const magicScript = `
     var v = state.video;
     if (state.interrupted) return false;
     if (isInPiP(v)) return false;
-    if (Date.now() < state.recoverUntil) return true;   // 正在接回声音
     if (state.userPaused) return Date.now() - state.userPausedAt < KEEPALIVE_IDLE_STOP;
     if (!isBackground()) return true;
     if (backgroundFor() < BG_KEEPALIVE_WINDOW) return true;
@@ -1857,7 +1804,6 @@ const magicScript = `
       '  inAd=' + state.inAd +
       '  keepAlive=' + !!state.keepAliveOsc +
       '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') +
-      '  recovering=' + (Date.now() < state.recoverUntil) +
       '  session=' + (audioSessionState() || '-') +
       '  mode=' + ((v && v.webkitPresentationMode) || 'inline') + '\\n' +
       state.logs.slice(-400).join('\\n');
@@ -1873,7 +1819,6 @@ const magicScript = `
     if (state.observerTimer) clearTimeout(state.observerTimer);
     if (state.observer) state.observer.disconnect();
     stopInterruptBeat();
-    stopAudioRecovery('');
 
     stopAudioKeepAlive();
     if (state.audioCtx) {

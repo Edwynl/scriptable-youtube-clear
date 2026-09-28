@@ -63,7 +63,13 @@ async function makePage(code) {
     window.AudioContext = function () {
       var et = new EventTarget();
       et.state = 'suspended'; et.destination = {}; et.__resumeCalls = 0;
-      et.resume = function () { et.__resumeCalls++; if (et.state !== 'interrupted') et.state = 'running'; return Promise.resolve(); };
+      et.resume = function () {
+        et.__resumeCalls++;
+        if (window.__blockResume) {   // 后台时音频会话激活失败：iOS 会把它标成 interrupted
+          if (et.state !== 'interrupted') { et.state = 'interrupted'; et.dispatchEvent(new Event('statechange')); }
+        } else if (et.state !== 'running') { et.state = 'running'; et.dispatchEvent(new Event('statechange')); }
+        return Promise.resolve();
+      };
       et.suspend = function () { if (et.state !== 'interrupted') et.state = 'suspended'; return Promise.resolve(); };
       et.close = function () { return Promise.resolve(); };
       et.createGain = function () { return { gain: { value: 1 }, connect(){}, disconnect(){} }; };
@@ -198,6 +204,26 @@ const SCENARIOS = [
       let n = 0; item.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
       item.querySelector('.title').dispatchEvent(new w.Event('touchend', { bubbles: true })); await sleep(1000);
       return '补点 ' + n + ' 次'; } },
+  { name: '真机日志复现：语音放完系统恢复播放但没声音，几秒后接回声音', expect: '无声→有声', run: async (w, v) => {
+      A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
+      await sleep(6000);
+      A.sysPause(w, v); await sleep(2500);                         // 微信语音
+      w.__blockResume = true;                                       // 微信还占着音频会话：后台激活失败
+      A.sysPlay(w, v); await sleep(3000);                           // 系统恢复成“播放中”，但无声
+      const mid = ctxOn(w) ? '有声' : '无声';
+      w.__blockResume = false; await sleep(2500);                   // 微信释放会话
+      // 接回后保活音频会按规则关掉（音乐自己占着会话），所以看“接回声音”的记录 + 音乐仍在播
+      const restored = (w.__ytClearScriptableMusic.logs || []).some(l => l.indexOf('audio restored') >= 0);
+      return mid + '→' + (restored && !v.paused ? '有声' : '无声'); } },
+  { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
+      const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
+      item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
+      w.document.body.appendChild(item);
+      let n = 0; item.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
+      const t = item.querySelector('.t');
+      t.dispatchEvent(new w.Event('touchend', { bubbles: true }));
+      t.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true }));
+      await sleep(1200); return n + ' 次'; } },
   { name: '锁屏“下一首”只切一首', expect: '1 次', run: async (w, v) => {
       let n = 0; w.document.querySelector('.next-button').addEventListener('click', () => n++);
       await sleep(300); w.__handlers.nexttrack && w.__handlers.nexttrack(); await sleep(300); return n + ' 次'; } },
@@ -241,11 +267,14 @@ const SCENARIOS = [
         !Object.prototype.hasOwnProperty.call(w.document, 'hidden')) ? '已还原' : '未还原'; } },
 ];
 
+// 调试：ONLY=关键字 只跑名字包含关键字的场景；DEBUG=1 打印每个场景最后 30 行脚本日志
+const ACTIVE = process.env.ONLY ? SCENARIOS.filter(x => x.name.indexOf(process.env.ONLY) >= 0) : SCENARIOS;
+
 async function runFile(file) {
   checkOuterSyntax(file);
   const code = extractInjected(file);
   new Function(code);
-  return Promise.all(SCENARIOS.map(async s => {
+  return Promise.all(ACTIVE.map(async s => {
     const { w, v, errors } = await makePage(code);
     w.dispatchEvent(new w.Event('load'));   // 真机上 load 在注入前就已触发；这里提前发，并等过渡期结束
     v.play();
@@ -253,6 +282,7 @@ async function runFile(file) {
     let got;
     try { got = await s.run(w, v); } catch (e) { got = '出错 ' + e.message; }
     if (errors.length) got += '（报错）';
+    if (process.env.DEBUG && w.__ytClearScriptableMusic) console.log('--- ' + s.name + '\n' + w.__ytClearScriptableMusic.logs.slice(-30).join('\n'));
     try { w.__ytClearScriptableMusic && w.__ytClearScriptableMusic.destroy(); } catch (e) {}
     w.close();
     return got;
@@ -264,8 +294,8 @@ for (const f of files) results.push(await runFile(f));
 const names = files.map(f => path.basename(f, '.js'));
 console.log('| 场景 | 期望 | ' + names.join(' | ') + ' |');
 console.log('|' + ['', '', ...names].map(() => '---').join('|') + '|');
-SCENARIOS.forEach((s, i) => console.log('| ' + [s.name, s.expect, ...results.map(r => (r[i] === s.expect ? '✅ ' : '❌ ') + r[i])].join(' | ') + ' |'));
+ACTIVE.forEach((s, i) => console.log('| ' + [s.name, s.expect, ...results.map(r => (r[i] === s.expect ? '✅ ' : '❌ ') + r[i])].join(' | ') + ' |'));
 console.log('');
-results.forEach((r, i) => console.log(`${names[i]}: ${r.filter((x, j) => x === SCENARIOS[j].expect).length}/${SCENARIOS.length} 通过`));
+results.forEach((r, i) => console.log(`${names[i]}: ${r.filter((x, j) => x === ACTIVE[j].expect).length}/${ACTIVE.length} 通过`));
 const last = results[results.length - 1];
-process.exit(last.every((x, j) => x === SCENARIOS[j].expect) ? 0 : 1);
+process.exit(last.every((x, j) => x === ACTIVE[j].expect) ? 0 : 1);
