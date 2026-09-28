@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.6-scriptable';
+const VERSION = '4.0.5-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -75,15 +75,14 @@ const magicScript = `
   }
 
   var BG_PAUSE_GRACE = 1000;                 // 前台暂停后这么短时间内切到后台 → 其实是切后台造成的
-  var BG_SETTLED = 300;                      // 进后台后出现的暂停 → 被别的 App 打断（微信语音、来电）
-                                             // 真机：切后台时系统从不主动暂停音乐；切到微信点开语音可能只要 1 秒多
+  var BG_SETTLED = 1500;                     // 进后台超过这么久才出现的暂停 → 被别的 App 打断（微信语音、来电）
   var BG_KEEPALIVE_WINDOW = 5000;            // 刚进后台的这段时间保持保活音频，防止 App 被挂起
   var KEEPALIVE_PLAYING_OFF = 1500;          // 后台稳定播放这么久后，停掉保活音频
   var KEEPALIVE_IDLE_STOP = 10 * 60 * 1000;  // 用户暂停超过 10 分钟，停掉保活音频省电
   var TAP_FALLBACK_DELAY = 450;              // 点了列表项多久没反应，才补点一次
   var INTERRUPT_BEAT = 4000;                 // 打断期间多久记一次心跳 / 检查一次是否结束
   var RESUME_PROTECT = 3000;                 // 打断结束恢复播放后，这么久内不让 YT Music 自己再暂停
-  var STALL_MS = 2500;                       // “播放中”但进度这么久不动 → 判定卡死
+  var AUDIO_RECOVERY_WINDOW = 30000;         // 系统恢复播放后，最多这么久内反复尝试把声音接回来
 
   var state = {
     loopTimer: null,
@@ -131,12 +130,12 @@ const magicScript = `
     interruptBeat: null,
     sessionState: '',          // navigator.audioSession 上一次的状态
     protectPlayUntil: 0,
-    lastProgressAt: 0,         // 播放进度最近一次前进的时间
-    lastProgressPos: 0,
-    stalledSince: 0,           // 卡死开始的时间
-    repairCooldownUntil: 0,
-    yieldedInBg: false,        // 后台让出过声音：回到 App 或用户点播放之前，后台不再启动保活音频
+    recoverUntil: 0,           // 正在把声音接回来（系统恢复了播放但音频会话没恢复）
+    recoverStartedAt: 0,
+    recoverTimer: null,
     lastLinkTapAt: 0,
+    expectNudgePause: false,   // 下一次暂停是我们自己“暂停再播放”重启播放器造成的
+    savedSessionType: null,    // 恢复期间临时改过 navigator.audioSession.type
 
     mediaSessionBound: false,
     lastMediaSessionRefresh: 0,
@@ -322,7 +321,7 @@ const magicScript = `
         ' [audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ' session=' + (audioSessionState() || '-') + ']');
       startInterruptBeat();
     }
-    if (isBackground()) state.yieldedInBg = true;
+    stopAudioRecovery('');
     state.shouldResume = false;
     applyKeepAlivePolicy('interrupted');
   }
@@ -374,78 +373,93 @@ const magicScript = `
     else if (prev === 'interrupted' && state.interrupted) endInterruption('audioSession ' + now);
   }
 
-  /* ─── 播放卡死检测与修复 ───
-     真机日志：微信语音打断后，系统会把音乐恢复成“播放中”，但进度一直是 +0.0s —— YT Music 的播放器卡死了，
-     在后台重新激活声音、暂停再播放都没用；回到 App 后要等 YT Music 自己十几秒后重建播放器才恢复。
-     现在：状态是“播放中”但进度 2.5 秒不动 → 立刻修复（先跳到当前位置重新缓冲，还不行就在原位置重新载入这首歌）。
-     后台只记录不修（修复会重新占用声音，可能打断下一条语音），回到 App 或点锁屏播放时马上修。 */
-  function watchProgress() {
-    var v = state.video;
+  /* ─── 把声音接回来 ───
+     真机日志：语音结束后系统会把音乐恢复成“播放中”，但 App 在后台时音频会话常常没能重新激活
+     （保活音频随即又变成 interrupted），结果是无声播放，回到 App 才有声音。
+     所以系统恢复后，每秒尝试一次重新激活音频会话（保活音频进入 running 即成功），最多 30 秒。
+     只在语音已经结束（系统已恢复播放）之后才做，不会在语音期间抢声音。 */
+  function startAudioRecovery(reason) {
     var now = Date.now();
-    if (!v || v.paused || v.ended || state.inAd || now < state.transitionUntil) {
-      state.lastProgressAt = now;
-      state.lastProgressPos = v ? v.currentTime : 0;
-      return;
-    }
-    if (Math.abs(v.currentTime - state.lastProgressPos) > 0.2) {
-      if (state.stalledSince) log('progress resumed after ' + ((now - state.stalledSince) / 1000).toFixed(1) + 's stall');
-      state.lastProgressPos = v.currentTime;
-      state.lastProgressAt = now;
-      state.stalledSince = 0;
-      return;
-    }
-    var stuckFor = now - state.lastProgressAt;
-    if (stuckFor < STALL_MS) return;
-    if (!state.stalledSince) {
-      state.stalledSince = state.lastProgressAt;
-      log('stalled at ' + v.currentTime.toFixed(1) + 's (playing but no progress' + (isBackground() ? ', in background: repair when back / on play' : '') + ')');
-    }
-    if (!isBackground()) repairStall('stuck ' + (stuckFor / 1000).toFixed(1) + 's');
-  }
-
-  function repairStall(reason) {
-    var now = Date.now();
-    if (now < state.repairCooldownUntil) return;
-    state.repairCooldownUntil = now + 8000;
-    var v = state.video;
-    var p = getPlayer();
-    if (!v) return;
-    var t0 = v.currentTime;
-    log('repair: seek to ' + t0.toFixed(1) + 's (' + reason + ')');
-    state.lastProgressAt = now;
-    state.lastProgressPos = t0;
-    try {
-      if (p && typeof p.seekTo === 'function') p.seekTo(t0, true);
-      else v.currentTime = t0;
-    } catch (e) {}
-    try { var pr = NATIVE.play.call(v); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
-    setTimeout(function () {
-      var vv = state.video;
-      if (vv && (vv !== v || Math.abs(vv.currentTime - t0) > 0.3)) { log('repair ok (seek)'); state.stalledSince = 0; return; }
-      var data = null;
-      try { data = p && typeof p.getVideoData === 'function' ? p.getVideoData() : null; } catch (e) {}
-      var id = data && data.video_id;
-      var load = p && (p.__ytClearNative_loadVideoById || p.loadVideoById);
-      if (id && typeof load === 'function') {
-        log('repair: reload ' + id + ' at ' + t0.toFixed(1) + 's');
-        clearUserPaused();
-        markTransition();
-        try { load.call(p, { videoId: id, startSeconds: t0 }); } catch (e) { try { load.call(p, id, t0); } catch (e2) {} }
-      } else {
-        log('repair: seek did not help, no player API to reload');
-      }
-    }, 1800);
-  }
-
-  // 回到 App / 点锁屏播放时：如果卡住了，马上修，不用等 2.5 秒
-  function repairIfStalledSoon(reason) {
-    var v0 = state.video;
-    var p0 = v0 ? v0.currentTime : 0;
-    setTimeout(function () {
+    state.recoverUntil = now + AUDIO_RECOVERY_WINDOW;
+    state.recoverStartedAt = now;
+    log('audio recovery start (' + reason + ')');
+    if (state.recoverTimer) clearInterval(state.recoverTimer);
+    var attempts = 0;
+    var step = function () {
+      var t = Date.now();
       var v = state.video;
-      if (!v || v !== v0 || v.paused || v.ended) return;
-      if (Math.abs(v.currentTime - p0) < 0.2) repairStall(reason);
-    }, 1200);
+      var ctx = state.audioCtx;
+      if (state.interrupted || state.userPaused) { stopAudioRecovery('stopped: ' + (state.interrupted ? 'interrupted again' : 'user paused')); return; }
+      if (t > state.recoverUntil) { stopAudioRecovery('gave up after ' + attempts + ' tries'); return; }
+      if (ctx && ctx.state === 'running' && attempts > 0) {
+        log('audio restored after ' + ((t - state.recoverStartedAt) / 1000).toFixed(1) + 's (' + attempts + ' tries, video ' + (v && !v.paused ? 'playing' : 'paused') + ')');
+        stopAudioRecovery('');
+        restartPlayer('audio restored');
+        return;
+      }
+      if (attempts === 0) setSessionType('playback');
+      attempts++;
+      startAudioKeepAlive();
+      if (ctx && ctx.state !== 'running') {
+        try { var p = ctx.resume(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
+      }
+      if (attempts % 5 === 0) log('audio recovery: try ' + attempts + ' [audio=' + (ctx ? ctx.state : '-') + ' video=' + (v && !v.paused ? 'playing' : 'paused') + ']');
+    };
+    state.recoverTimer = setInterval(step, 1000);
+    setTimeout(step, 150);
+  }
+
+  /* 真机：系统先把音乐恢复成“播放中”，那时音频会话还没激活，底层播放器启动失败 → 无声；
+     会话随后激活了，但没有东西让播放器重新启动。所以声音接回来后，暂停再马上播放一次，
+     并记录播放进度有没有在走（区分“无声但在走”和“卡住不动”）。 */
+  function restartPlayer(reason) {
+    var v = state.video;
+    if (!v || v.ended) return;
+    var t0 = v.currentTime;
+    log('restart player (' + reason + ') at ' + t0.toFixed(1) + 's');
+    // 只忽略我们自己造成的这一次暂停（不能按时间窗口忽略，否则会吞掉紧接着的下一条微信语音）
+    if (!v.paused) {
+      state.expectNudgePause = true;
+      setTimeout(function () { state.expectNudgePause = false; }, 600);
+      try { NATIVE.pause.call(v); } catch (e) { state.expectNudgePause = false; }
+    }
+    setTimeout(function () {
+      try {
+        var p = NATIVE.play.call(v);
+        if (p && p.catch) p.catch(function (err) { log('restart play blocked ' + (err && err.name)); });
+      } catch (e) {}
+    }, 200);
+    setTimeout(function () {
+      var dt = v.currentTime - t0;
+      log('progress after restart: +' + dt.toFixed(1) + 's (' + (v.paused ? 'paused' : 'playing') +
+        ', audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ')');
+      restoreSessionType();
+    }, 3000);
+  }
+
+  // 恢复期间把网页的音频类型设成 playback，让系统按“音乐播放”处理并重新激活会话；结束后改回原值
+  function setSessionType(type) {
+    var as = navigator.audioSession;
+    if (!as || typeof as.type === 'undefined') return;
+    try {
+      if (state.savedSessionType === null) state.savedSessionType = as.type;
+      if (as.type !== type) { as.type = type; log('audioSession.type = ' + as.type); }
+    } catch (e) { log('audioSession.type not writable'); }
+  }
+
+  function restoreSessionType() {
+    var as = navigator.audioSession;
+    if (!as || state.savedSessionType === null) return;
+    try {
+      if (as.type !== state.savedSessionType) { as.type = state.savedSessionType; log('audioSession.type = ' + as.type + ' (restored)'); }
+    } catch (e) {}
+    state.savedSessionType = null;
+  }
+
+  function stopAudioRecovery(msg) {
+    if (state.recoverTimer) { clearInterval(state.recoverTimer); state.recoverTimer = null; }
+    state.recoverUntil = 0;
+    if (msg) { log('audio recovery ' + msg); restoreSessionType(); }
   }
 
   // 恢复播放：通过 YT Music 自己的 playVideo，播放器界面和状态才会同步（否则它可能马上又暂停）
@@ -454,6 +468,8 @@ const magicScript = `
     var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
     log('resume after interruption (' + reason + ')');
     state.protectPlayUntil = Date.now() + RESUME_PROTECT;
+    // 对方已经交还声音：先把保活音频接回来（重新激活音频会话），后台才允许开始播放
+    if (isBackground()) startAudioRecovery(reason);
     applyKeepAlivePolicy('resume');
     try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
     softResume(400);
@@ -574,9 +590,8 @@ const magicScript = `
     state.realBackgrounded = false;
     state.bgSince = 0;
     state.hiddenSince = 0;
-    state.yieldedInBg = false;
+    if (state.recoverUntil) stopAudioRecovery('ended: back to app');
     endInterruption('back to app');
-    repairIfStalledSoon('back to app');
     applyKeepAlivePolicy('fg');
     rebindMediaSession();
     if (state.pendingUnmute) {
@@ -656,7 +671,6 @@ const magicScript = `
     HTMLMediaElement.prototype.play = function () {
       if (this && this.tagName === 'VIDEO') {
         if (!shouldAllowPagePlay('page play()')) return Promise.resolve();
-        if (recentGesture()) { state.yieldedInBg = false; repairIfStalledSoon('user play'); }
         clearUserPaused();
         startAudioKeepAlive();   // 在用户手势的调用栈里启动，iOS 才允许
       }
@@ -1128,6 +1142,7 @@ const magicScript = `
         setTimeout(function () {
           if (vv) log('progress 3s after system resume: +' + (vv.currentTime - tStart).toFixed(1) + 's (' + (vv.paused ? 'paused' : 'playing') + ')');
         }, 3000);
+        startAudioRecovery('system resume');
       }
     }
     if (!state.playingSince) state.playingSince = Date.now();
@@ -1158,6 +1173,7 @@ const magicScript = `
     state.lastMediaEventAt = Date.now();
     if (!video || video.ended || isNearEnd(video)) { log('pause: track end'); applyKeepAlivePolicy('track end'); return; }  // 一首播完，交给 YT Music 切歌
     if (state.inAd) { log('pause: ad'); return; }
+    if (state.expectNudgePause) { state.expectNudgePause = false; log('pause: restart player'); return; }
     if (Date.now() < state.transitionUntil) { log('pause: transition'); return; }
     if (state.userPaused || state.interrupted) {
       log('pause: ' + (state.interrupted ? 'while interrupted' : 'user paused (' + state.userPausedReason + ')'));
@@ -1320,8 +1336,6 @@ const magicScript = `
 
     setMediaAction('play', function () {
       log('ms play');
-      state.yieldedInBg = false;
-      repairIfStalledSoon('lock screen play');
       stopInterruptBeat();
       state.interrupted = false;
       state.resumeAfterInterruption = false;
@@ -1516,7 +1530,7 @@ const magicScript = `
     var v = state.video;
     if (state.interrupted) return false;
     if (isInPiP(v)) return false;
-    if (state.yieldedInBg && isBackground()) return false;   // 后台让出过声音：不再抢
+    if (Date.now() < state.recoverUntil) return true;   // 正在接回声音
     if (state.userPaused) return Date.now() - state.userPausedAt < KEEPALIVE_IDLE_STOP;
     if (!isBackground()) return true;
     if (backgroundFor() < BG_KEEPALIVE_WINDOW) return true;
@@ -1775,7 +1789,6 @@ const magicScript = `
     trackContentState();
     updateMediaSession();
     applyKeepAlivePolicy('tick');
-    watchProgress();
 
     if (state.shouldResume && canAutoResume()) {
       var video = getVideo();
@@ -1901,8 +1914,7 @@ const magicScript = `
       '  inAd=' + state.inAd +
       '  keepAlive=' + !!state.keepAliveOsc +
       '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') +
-      '  stalled=' + !!state.stalledSince +
-      '  yielded=' + state.yieldedInBg +
+      '  recovering=' + (Date.now() < state.recoverUntil) +
       '  session=' + (audioSessionState() || '-') +
       '  mode=' + ((v && v.webkitPresentationMode) || 'inline') + '\\n' +
       state.logs.slice(-400).join('\\n');
@@ -1918,6 +1930,7 @@ const magicScript = `
     if (state.observerTimer) clearTimeout(state.observerTimer);
     if (state.observer) state.observer.disconnect();
     stopInterruptBeat();
+    stopAudioRecovery('');
 
     stopAudioKeepAlive();
     if (state.audioCtx) {

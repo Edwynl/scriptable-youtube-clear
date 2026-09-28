@@ -5,7 +5,7 @@
   "scripts": {
     "test": "node compare.mjs && node smoke.mjs && node music.mjs && node music-outer.mjs",
     "compare": "node compare.mjs ../archive/v1.4.0-original.js ../archive/v1.5.0-claude.js ../archive/v1.5.0-codex.js ../archive/v1.6.0.js ../archive/v1.7.0.js ../archive/v1.7.1.js ../archive/v1.8.0.js ../archive/v1.8.1.js ../archive/v1.8.2.js ../archive/v1.8.3.js ../YouTubeClear.js",
-    "music": "node music.mjs ../music/archive/v3.5.4-original.js ../music/archive/v4.0.0.js ../music/archive/v4.0.1.js ../music/archive/v4.0.2.js ../music/archive/v4.0.3.js ../music/archive/v4.0.4.js ../music/YouTubeMusicClear.js && node music-outer.mjs"
+    "music": "node music.mjs ../music/archive/v3.5.4-original.js ../music/archive/v4.0.0.js ../music/archive/v4.0.1.js ../music/archive/v4.0.2.js ../music/archive/v4.0.3.js ../music/archive/v4.0.4.js ../music/archive/v4.0.5.js ../music/YouTubeMusicClear.js && node music-outer.mjs"
   },
   "devDependencies": {
     "jsdom": "^24.1.3"

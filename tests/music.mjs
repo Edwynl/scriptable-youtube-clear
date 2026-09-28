@@ -40,7 +40,7 @@ async function makePage(code) {
     Object.defineProperty(P, 'ended',        { get(){ return false; }, configurable: true });
     Object.defineProperty(P, 'readyState',   { get(){ return 4; }, configurable: true });
     Object.defineProperty(P, 'duration',     { get(){ return this.__dur !== undefined ? this.__dur : 200; }, configurable: true });
-    Object.defineProperty(P, 'currentTime',  { get(){ return this.__t || 0; }, set(v){ this.__t = v; }, configurable: true });
+    Object.defineProperty(P, 'currentTime',  { get(){ return this.__t || 0; }, set(v){ this.__t = v; window.__stall = false; }, configurable: true });
     Object.defineProperty(P, 'muted',        { get(){ return !!this.__m; }, set(v){ this.__m = !!v; }, configurable: true });
     Object.defineProperty(P, 'playbackRate', { get(){ return this.__r || 1; }, set(v){ this.__r = v; }, configurable: true });
     window.__plays = 0;
@@ -54,6 +54,8 @@ async function makePage(code) {
       var was = !this.paused; this.__p = true;
       if (was) this.dispatchEvent(new Event('pause'));
     };
+    // 播放时进度每 100ms 前进 0.1 秒；__stall = true 模拟“播放中但卡死”（跳转进度后解除）
+    setInterval(function () { var v = document.querySelector('video'); if (v && !v.paused && !window.__stall) v.__t = (v.__t || 0) + 0.1; }, 100);
     window.__sysPause = P.pause;   // 系统造成的暂停：不经过网页 JS
     window.__sysPlay = P.play;     // 系统自动恢复 / 系统控件的播放
     window.__origPlay = P.play;
@@ -204,26 +206,29 @@ const SCENARIOS = [
       let n = 0; item.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
       item.querySelector('.title').dispatchEvent(new w.Event('touchend', { bubbles: true })); await sleep(1000);
       return '补点 ' + n + ' 次'; } },
-  { name: '真机日志复现：语音放完系统恢复播放但没声音，几秒后接回声音', expect: '无声→有声', run: async (w, v) => {
+  { name: '真机日志复现：切到后台 1 秒多就点开微信语音，也不抢', expect: '暂停，抢 0 次', run: async (w, v) => {
+      A.blur(w); await sleep(800); return grabText(await interruptFor(w, v, 3000, false)); } },
+  { name: '真机日志复现：语音后系统恢复但播放卡住，后台不去抢声音', expect: '卡住，抢 0 次', run: async (w, v) => {
       A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
-      await sleep(6000);
-      A.sysPause(w, v); await sleep(2500);                         // 微信语音
-      w.__blockResume = true;                                       // 微信还占着音频会话：后台激活失败
-      A.sysPlay(w, v); await sleep(3000);                           // 系统恢复成“播放中”，但无声
-      const mid = ctxOn(w) ? '有声' : '无声';
-      w.__blockResume = false; await sleep(2500);                   // 微信释放会话
-      // 接回后保活音频会按规则关掉（音乐自己占着会话），所以看“接回声音”的记录 + 音乐仍在播
-      const restored = (w.__ytClearScriptableMusic.logs || []).some(l => l.indexOf('audio restored') >= 0);
-      return mid + '→' + (restored && !v.paused ? '有声' : '无声'); } },
-  { name: '声音接回来后重启播放器（暂停再播放），且不被当成新的打断', expect: '已重启，播放中', run: async (w, v) => {
+      await sleep(3000); A.sysPause(w, v); await sleep(2500);
+      w.__stall = true; const c = ctxOf(w); const r0 = c ? c.__resumeCalls : 0; const p0 = w.__plays;
+      A.sysPlay(w, v); await sleep(5000);
+      const grabbed = (c ? c.__resumeCalls - r0 : 0) + (w.__plays - p0 - 1);   // 减去系统自己那一次
+      return (w.__stall ? '卡住' : '被改动') + '，抢 ' + grabbed + ' 次'; } },
+  { name: '真机日志复现：回到 App 时播放卡住，马上修复（不用等十几秒）', expect: '已恢复', run: async (w, v) => {
       A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
-      await sleep(6000);
-      A.sysPause(w, v); await sleep(2500);
-      w.__blockResume = true; A.sysPlay(w, v); await sleep(1500);
-      w.__blockResume = false; await sleep(2500);
-      const s = w.__ytClearScriptableMusic.state, logs = w.__ytClearScriptableMusic.logs;
-      const restarted = logs.some(l => l.indexOf('restart player') >= 0);
-      return (restarted ? '已重启' : '未重启') + '，' + (s.interrupted ? '误判打断' : (v.paused ? '暂停' : '播放中')); } },
+      await sleep(3000); A.sysPause(w, v); await sleep(2000); w.__stall = true; A.sysPlay(w, v); await sleep(3000);
+      w.__fakeHidden = false; w.document.dispatchEvent(new w.Event('visibilitychange')); A.focus(w);
+      const t0 = v.currentTime; await sleep(3000);
+      return (v.currentTime - t0 > 0.5 && !v.paused) ? '已恢复' : '仍卡住'; } },
+  { name: '语音后在锁屏点播放，卡住时马上修复', expect: '已恢复', run: async (w, v) => {
+      A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
+      await sleep(3000); A.sysPause(w, v); await sleep(2000);
+      w.__stall = true; w.__handlers.play && w.__handlers.play(); const t0 = v.currentTime; await sleep(3000);
+      return (v.currentTime - t0 > 0.5 && !v.paused) ? '已恢复' : '仍卡住'; } },
+  { name: '正常播放不会被误判为卡住', expect: '无误修', run: async (w, v) => {
+      await sleep(5000); const logs = w.__ytClearScriptableMusic.logs || [];
+      return logs.some(l => l.indexOf('repair') >= 0 || l.indexOf('stalled') >= 0) ? '误修' : '无误修'; } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
@@ -250,7 +255,7 @@ const SCENARIOS = [
       const r = w.document.createElement('ytmusic-ad-instream-ads-renderer');
       r.appendChild(w.document.createElement('div')); w.document.body.appendChild(r);
       await sleep(1500);
-      return (v.playbackRate === 1 && !v.muted && v.currentTime === 10) ? '正常' : ('被改了 ' + v.playbackRate + 'x ' + (v.muted ? '静音' : '') + ' 进度' + v.currentTime); } },
+      return (v.playbackRate === 1 && !v.muted && v.currentTime < 50) ? '正常' : ('被改了 ' + v.playbackRate + 'x ' + (v.muted ? '静音' : '') + ' 进度' + v.currentTime.toFixed(1)); } },
   { name: '“还在听吗？”弹窗自动点掉并继续播放', expect: '已点，播放', run: async (w, v) => {
       await sleep(300);
       const d = w.document.createElement('ytmusic-you-there-renderer');
