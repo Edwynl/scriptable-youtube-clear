@@ -1,0 +1,1807 @@
+// Variables used by Scriptable.
+// These must be at the very top of the file. Do not edit.
+// icon-color: red; icon-glyph: music;
+
+const VERSION = '4.0.0-scriptable';
+
+if (!config.runsInApp) {
+  const alert = new Alert();
+  alert.title = '需要在 Scriptable App 内运行';
+  alert.message = [
+    '这个脚本要先配置 WebView 再注入去广告代码。',
+    '',
+    '请在快捷指令的 Scriptable 动作里打开 Run In App / 在 App 中运行，然后再添加到桌面。',
+    '',
+    '不要使用普通的 Run Scriptable Script 扩展模式，也不要用 WebView.loadURL 的快捷指令小窗。'
+  ].join('\n');
+  alert.addAction('知道了');
+  await alert.presentAlert();
+  Script.complete();
+} else {
+
+const url = 'https://music.youtube.com';
+const webView = new WebView();
+
+await webView.loadURL(url);
+
+const magicScript = `
+(function () {
+  'use strict';
+
+  var VERSION = '${VERSION}';
+  var previous = window.__ytClearScriptableMusic;
+  if (previous && previous.version === VERSION) return null;
+  if (previous && typeof previous.destroy === 'function') {
+    try { previous.destroy(); } catch (e) {}
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     基础：原生方法 / 真实可见性 / 监听器登记 / 状态
+     ══════════════════════════════════════════════════════════ */
+
+  // 原生方法只保存一次：重复注入时不会层层包装
+  var NATIVE = window.__ytClearMusicNatives || (window.__ytClearMusicNatives = {
+    play: HTMLMediaElement.prototype.play,
+    pause: HTMLMediaElement.prototype.pause,
+    addEventListener: EventTarget.prototype.addEventListener,
+    open: window.open
+  });
+
+  // 真实的 document.hidden（下面会把它伪装成 false）
+  // 注意：Scriptable 里后台时它也常常读到 false，所以后台判断主要靠 blur 事件
+  var nativeHiddenGetter = (function () {
+    var proto = Object.getPrototypeOf(document);
+    while (proto) {
+      var d = Object.getOwnPropertyDescriptor(proto, 'hidden');
+      if (d) return typeof d.get === 'function' ? d.get : null;
+      proto = Object.getPrototypeOf(proto);
+    }
+    return null;
+  })();
+
+  function isReallyHidden() {
+    try { return nativeHiddenGetter ? !!nativeHiddenGetter.call(document) : false; }
+    catch (e) { return false; }
+  }
+
+  // 统一登记监听器，destroy() 时全部移除
+  var listeners = [];
+  function listen(target, type, fn, opts) {
+    NATIVE.addEventListener.call(target, type, fn, opts);
+    listeners.push([target, type, fn, opts]);
+  }
+
+  var BG_PAUSE_GRACE = 1000;                 // 前台暂停后这么短时间内切到后台 → 其实是切后台造成的
+  var BG_SETTLED = 1500;                     // 进后台超过这么久才出现的暂停 → 被别的 App 打断（微信语音、来电）
+  var BG_KEEPALIVE_WINDOW = 5000;            // 刚进后台的这段时间保持保活音频，防止 App 被挂起
+  var KEEPALIVE_PLAYING_OFF = 1500;          // 后台稳定播放这么久后，停掉保活音频
+  var KEEPALIVE_IDLE_STOP = 10 * 60 * 1000;  // 用户暂停超过 10 分钟，停掉保活音频省电
+  var TAP_FALLBACK_DELAY = 450;              // 点了列表项多久没反应，才补点一次
+
+  var state = {
+    loopTimer: null,
+    observer: null,
+    observerTimer: null,
+
+    audioCtx: null,
+    keepAliveOsc: null,
+    keepAliveGain: null,
+    silenceTimer: null,
+
+    video: null,
+    player: null,
+    patchedPlayers: [],
+
+    inAd: false,
+    burstUntil: 0,
+    cooldownUntil: 0,
+    lastSkipClick: 0,
+    contentRate: 1,            // 正片（非广告）时用户自己的倍速 / 静音，广告结束后恢复
+    contentMuted: false,
+    touchedRate: false,
+    touchedMute: false,
+
+    shouldResume: false,       // 希望保持播放
+    userPaused: false,         // 已被认定为暂停（用户或前台系统），不自动恢复
+    userPausedAt: 0,
+    userPausedReason: '',
+    fgPauseAt: 0,              // 最近一次“前台非手势暂停”，切后台时可撤销
+    fgPauseNative: false,
+
+    recentGestureUntil: 0,
+    allowPauseUntil: 0,
+    transitionUntil: 0,
+
+    realBackgrounded: false,
+    bgSince: 0,                // 第一次收到后台事件的时间
+    hiddenSince: 0,            // 页面真正隐藏的时间（能读到时）
+
+    interrupted: false,        // 被别的 App 打断中（微信语音、来电、Siri）
+    interruptedAt: 0,
+    resumeAfterInterruption: false,
+    playBlockLogged: false,
+    playingSince: 0,           // 这一段连续播放开始的时间
+
+    mediaSessionBound: false,
+    lastMediaSessionRefresh: 0,
+    pendingUnmute: false,
+
+    lastTapPoint: null,
+    lastPromptScan: 0,
+    lastDialogCheck: 0,
+
+    debugTaps: [],
+    logs: []
+  };
+
+  function log(message) {
+    try {
+      var t = new Date();
+      state.logs.push(t.toTimeString().slice(0, 8) + '.' + ('00' + t.getMilliseconds()).slice(-3) + ' ' + message);
+      if (state.logs.length > 800) state.logs.splice(0, 200);
+    } catch (e) {}
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     CSS：隐藏广告和“打开 App”提示
+     （“还在听吗？”弹窗不再隐藏，否则脚本看不见它，也就点不掉）
+     ══════════════════════════════════════════════════════════ */
+
+  var css = [
+    'html,body{touch-action:manipulation!important;-webkit-tap-highlight-color:transparent!important;}',
+    '*{-webkit-tap-highlight-color:transparent!important;}',
+    [
+      'ytmusic-ad-instream-ads-renderer',
+      'ytmusic-mealbar-promo-renderer',
+      'ytmusic-statement-banner-renderer',
+      '.ytmusic-player-ad-overlay',
+      '.ytmusic-mealbar-promo-renderer',
+      '.video-ads',
+      '.ytp-ad-overlay-container',
+      '.ytp-ad-text-overlay',
+      '.ytp-ad-overlay-slot',
+      '.ytp-ad-overlay-close-container',
+      '.ytp-ad-player-overlay',
+      '.ytp-ad-player-overlay-instream-info',
+      '.ytp-ad-module',
+      '#player-ads',
+      '#masthead-ad',
+      'ytd-ad-slot-renderer',
+      'ytd-in-feed-ad-layout-renderer',
+      'ytd-action-companion-ad-renderer',
+      'ytd-display-ad-renderer',
+      'ytd-companion-slot-renderer',
+      'ytd-promoted-sparkles-web-renderer',
+      'ytd-promoted-video-renderer',
+      'ytd-video-masthead-ad-v3-renderer',
+      'ytd-mealbar-promo-renderer',
+      'ytd-survey-renderer',
+      'ytm-promoted-video-renderer',
+      'ytm-companion-ad-renderer',
+      'ytm-companion-slot'
+    ].join(',') + '{display:none!important;visibility:hidden!important;opacity:0!important;height:0!important;min-height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;margin:0!important;padding:0!important;}',
+    [
+      '.open-app-button',
+      'a[href*="itunes.apple.com"]',
+      'a[href*="apps.apple.com"]',
+      'a[href*="music.apple.com"]',
+      'button[aria-label*="Open app" i]',
+      'button[aria-label*="打开应用"]',
+      '[aria-label*="Open app" i]',
+      '[aria-label*="打开应用"]',
+      'ytmusic-app-header-renderer .cta-button',
+      'ytmusic-app-header-renderer [href*="itunes"]',
+      'ytmusic-app-header-renderer [href*="apps.apple"]',
+      'ytmusic-app-header-renderer [href*="youtubemusic"]',
+      '[data-redirect*="app"]'
+    ].join(',') + '{display:none!important;}'
+  ].join('\\n');
+
+  var adElementSelectors = [
+    'ytmusic-ad-instream-ads-renderer',
+    '.ytmusic-player-ad-overlay',
+    '.video-ads',
+    '.ytp-ad-overlay-container',
+    '.ytp-ad-text-overlay',
+    '.ytp-ad-overlay-slot',
+    '.ytp-ad-player-overlay',
+    '#player-ads'
+  ];
+
+  var skipSelectors = [
+    '.ytp-ad-skip-button-modern',
+    '.ytp-ad-skip-button',
+    '.ytp-skip-ad-button',
+    '.ytp-ad-skip-button-container button',
+    'button.ytp-ad-skip-button',
+    'button[aria-label*="Skip"]',
+    'button[aria-label*="skip"]',
+    'button[aria-label*="跳过"]',
+    'button[aria-label*="略過"]',
+    'button[aria-label*="スキップ"]'
+  ];
+
+  function injectCSS() {
+    var id = 'yt-clear-scriptable-music-css';
+    if (document.getElementById(id)) return;
+    var style = document.createElement('style');
+    style.id = id;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     暂停状态机
+     ══════════════════════════════════════════════════════════ */
+
+  function setUserPaused(reason) {
+    if (!state.userPaused) log('paused: ' + reason);
+    state.userPaused = true;
+    state.shouldResume = false;
+    state.userPausedAt = Date.now();
+    state.userPausedReason = reason;
+    state.fgPauseAt = 0;
+  }
+
+  function clearUserPaused() {
+    state.userPaused = false;
+    state.shouldResume = true;
+    state.userPausedAt = 0;
+    state.userPausedReason = '';
+    state.fgPauseAt = 0;
+  }
+
+  // 前台出现、但网页没收到触摸的暂停（拔耳机、来电、YT Music 自己暂停）：先当作暂停；
+  // 如果 BG_PAUSE_GRACE 内真的切到后台，说明是切后台造成的，再撤销。
+  function acceptForegroundPause(reason, native) {
+    setUserPaused(reason);
+    state.fgPauseAt = Date.now();
+    state.fgPauseNative = !!native;
+  }
+
+  // 真的是用户亲手暂停的（点了按钮 / 锁屏 / 原生播放器）
+  function isGenuineUserPause() {
+    var r = state.userPausedReason;
+    return state.userPaused && (r.indexOf('(user)') >= 0 || r === 'lock screen' || r === 'native player');
+  }
+
+  function isBackground() {
+    return state.realBackgrounded || isReallyHidden();
+  }
+
+  function backgroundFor() {
+    var start = state.hiddenSince || state.bgSince;
+    return start ? Date.now() - start : 0;
+  }
+
+  function recentGesture() {
+    var now = Date.now();
+    return now < state.recentGestureUntil || now < state.allowPauseUntil;
+  }
+
+  function isWindowLevelEvent(event) {
+    // window 上的捕获监听也会收到输入框等元素的 focus/blur，要排除掉
+    return !event || !event.target || event.target === window || event.target === document;
+  }
+
+  /* ─── 被别的 App 打断（微信语音、来电、Siri）───
+     打断期间：不恢复播放、不让 YT Music 自己恢复、停掉保活音频，把声音让给对方；
+     系统恢复播放 / 锁屏点播放 / 回到 App 时再继续。 */
+  function beginInterruption(reason) {
+    var now = Date.now();
+    if (!state.interrupted) {
+      state.interrupted = true;
+      state.interruptedAt = now;
+      state.playBlockLogged = false;
+      state.resumeAfterInterruption = state.shouldResume && !state.userPaused;
+      // 刚才那次暂停被当成了“前台系统暂停”，其实是打断
+      if (state.userPaused && now - state.userPausedAt < 1500 && !isGenuineUserPause()) {
+        state.userPaused = false;
+        state.resumeAfterInterruption = true;
+      }
+      log('interrupted: ' + reason + (state.resumeAfterInterruption ? ' (will resume)' : ''));
+    }
+    state.shouldResume = false;
+    applyKeepAlivePolicy('interrupted');
+  }
+
+  function endInterruption(reason) {
+    if (!state.interrupted) return;
+    state.interrupted = false;
+    log('interruption ended: ' + reason);
+    if (state.resumeAfterInterruption && !state.userPaused) {
+      clearUserPaused();
+      softResume(600);
+      softResume(1500);
+    }
+    state.resumeAfterInterruption = false;
+  }
+
+  function onAudioStateChange() {
+    var ctx = state.audioCtx;
+    if (!ctx) return;
+    log('audio ' + ctx.state);
+    if (ctx.state === 'interrupted') beginInterruption('audio session');
+    else if (ctx.state === 'running' && state.interrupted) endInterruption('audio running');
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     后台 / 前台
+     ══════════════════════════════════════════════════════════ */
+
+  function patchVisibility() {
+    try {
+      Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true });
+      Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true });
+      Object.defineProperty(document, 'webkitHidden', { get: function () { return false; }, configurable: true });
+      Object.defineProperty(document, 'webkitVisibilityState', { get: function () { return 'visible'; }, configurable: true });
+      document.hasFocus = function () { return true; };
+    } catch (e) {
+      log('visibility patch partial');
+    }
+
+    ['visibilitychange', 'webkitvisibilitychange', 'freeze'].forEach(function (type) {
+      listen(document, type, onBackgroundEvent, true);
+    });
+    ['pagehide', 'blur', 'freeze'].forEach(function (type) {
+      listen(window, type, onBackgroundEvent, true);
+    });
+    ['pageshow', 'focus', 'resume'].forEach(function (type) {
+      listen(window, type, onForeground, true);
+      listen(document, type, onForeground, true);
+    });
+  }
+
+  function onBackgroundEvent(event) {
+    if (!isWindowLevelEvent(event)) return;   // 元素失焦：不拦截、不当成切后台
+
+    var type = (event && event.type) || 'unknown';
+    var hidden = isReallyHidden();
+    if (event && typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+    // visibilitychange 回到前台时也会触发
+    if ((type === 'visibilitychange' || type === 'webkitvisibilitychange') && !hidden) {
+      onForeground();
+      return;
+    }
+    // 进入原生全屏时 iOS 会发 blur，这不是切后台
+    if (!hidden && type === 'blur' && inNativePlayer(state.video || findVideo())) {
+      log('blur ignored (native player)');
+      return;
+    }
+
+    var hardBg = hidden || type === 'pagehide' || type === 'freeze';
+    var v = state.video || findVideo();
+    log('bg ' + type + (hardBg ? ' (hidden)' : '') + (v && !v.paused ? ' playing' : ' paused'));
+    state.realBackgrounded = true;
+    if (!state.bgSince) state.bgSince = Date.now();
+    if (hardBg && !state.hiddenSince) state.hiddenSince = Date.now();
+
+    // 刚被当作暂停的前台暂停，其实是切后台造成的 → 撤销
+    if (state.fgPauseAt && Date.now() - state.fgPauseAt < BG_PAUSE_GRACE && (hardBg || !state.fgPauseNative)) {
+      log('pause was caused by backgrounding -> revert');
+      clearUserPaused();
+    }
+
+    applyKeepAlivePolicy('bg');
+    rebindMediaSession();
+    setTimeout(rebindMediaSession, 450);
+    setTimeout(rebindMediaSession, 1600);
+    if (state.shouldResume && !state.userPaused && !state.interrupted) {
+      syncResume();
+      softResume(120);
+      softResume(700);
+      softResume(1800);
+    }
+  }
+
+  function onForeground(event) {
+    if (!isWindowLevelEvent(event)) return;
+    // 页面在后台被系统唤醒时也可能发 resume / focus / pageshow，这不是回到 App
+    if (isReallyHidden()) {
+      log('fg ' + ((event && event.type) || '') + ' ignored (still hidden)');
+      return;
+    }
+    log('fg' + (event && event.type ? ' ' + event.type : ''));
+    state.realBackgrounded = false;
+    state.bgSince = 0;
+    state.hiddenSince = 0;
+    endInterruption('back to app');
+    applyKeepAlivePolicy('fg');
+    rebindMediaSession();
+    if (state.pendingUnmute) {
+      state.pendingUnmute = false;
+      var video = getVideo();
+      if (video && !state.inAd && !state.touchedMute) video.muted = false;
+    }
+    if (state.shouldResume && !state.userPaused && !state.inAd) {
+      softResume(120);
+      softResume(700);
+    }
+  }
+
+  // 按页面真实可见性补记“进入后台的时间”（能读到时）
+  function trackHidden() {
+    if (isReallyHidden()) {
+      if (!state.hiddenSince) state.hiddenSince = Date.now();
+    } else if (state.hiddenSince) {
+      state.hiddenSince = 0;
+    }
+  }
+
+  // 阻止 YT Music 注册 visibilitychange / blur 等监听（它靠这些在后台暂停）
+  function patchBackgroundEventRegistration() {
+    var blocked = {
+      visibilitychange: true, webkitvisibilitychange: true,
+      pagehide: true, freeze: true, resume: true, blur: true
+    };
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      if (type && blocked[type] && (this === document || this === window)) {
+        log('blocked listener ' + type);
+        return;
+      }
+      return NATIVE.addEventListener.call(this, type, listener, options);
+    };
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     网页发起的暂停 / 播放
+     ══════════════════════════════════════════════════════════ */
+
+  // video.pause() / player.pauseVideo()：只在真的在后台时拦截；前台一律放行，由 onVideoPause 判断
+  function shouldAllowPause(source, el) {
+    var now = Date.now();
+    if (recentGesture()) {
+      setUserPaused(source + ' (user)');
+      return true;
+    }
+    if (now < state.transitionUntil) return true;
+    if (state.interrupted || state.userPaused || !state.shouldResume) return true;
+    if (inNativePlayer(el || state.video || findVideo())) {
+      log(source + ' blocked (native player)');
+      return false;
+    }
+    if (isBackground()) {
+      log(source + ' blocked (background)');
+      return false;
+    }
+    return true;
+  }
+
+  // video.play() / player.playVideo()：被打断期间、在后台时，不许 YT Music 自己把声音抢回来
+  function shouldAllowPagePlay(source) {
+    if (state.interrupted && isBackground() && !recentGesture() && Date.now() >= state.transitionUntil) {
+      if (!state.playBlockLogged) { log(source + ' blocked (interrupted)'); state.playBlockLogged = true; }
+      return false;
+    }
+    if (isBackground()) log(source + ' in background');
+    return true;
+  }
+
+  function patchMedia() {
+    HTMLMediaElement.prototype.play = function () {
+      if (this && this.tagName === 'VIDEO') {
+        if (!shouldAllowPagePlay('page play()')) return Promise.resolve();
+        clearUserPaused();
+        startAudioKeepAlive();   // 在用户手势的调用栈里启动，iOS 才允许
+      }
+      return NATIVE.play.apply(this, arguments);
+    };
+
+    HTMLMediaElement.prototype.pause = function () {
+      if (this && this.tagName === 'VIDEO' && !shouldAllowPause('pause()', this)) {
+        softResume(80);
+        return undefined;
+      }
+      return NATIVE.pause.apply(this, arguments);
+    };
+  }
+
+  function markGesture() {
+    state.recentGestureUntil = Date.now() + 1300;
+    if (!state.userPaused) startAudioKeepAlive();
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     “打开 App”链接：改成在网页里打开
+     ══════════════════════════════════════════════════════════ */
+
+  function webEquivalent(href) {
+    href = String(href || '');
+    var watch = href.match(/watch\\?[^#]*/i);
+    if (watch) return '/' + watch[0];
+    var playlist = href.match(/playlist\\?[^#]*/i);
+    if (playlist) return '/' + playlist[0];
+    var channel = href.match(/(channel|browse)\\/[^#?]*/i);
+    if (channel) return '/' + channel[0];
+    return null;
+  }
+
+  // 只有点歌（watch）才是“要开始播放”；点歌单 / 频道只是打开页面，暂停中的音乐不该自己响起来
+  function isPlayPath(path) {
+    return String(path || '').indexOf('/watch') === 0;
+  }
+
+  function prepareNavigation(path) {
+    markTransition();
+    if (isPlayPath(path)) clearUserPaused();
+  }
+
+  function isNativeAppHref(href) {
+    return /^(youtubemusic|itms-apps|itms|com\\.google\\.ios\\.youtubemusic):\\/\\//i.test(String(href || '')) ||
+      /itunes\\.apple\\.com|apps\\.apple\\.com|music\\.apple\\.com/i.test(String(href || ''));
+  }
+
+  function navigateToWebPath(path) {
+    if (!path) return false;
+    var target = 'https://music.youtube.com' + path;
+    log('reload web: ' + path.slice(0, 80));
+    prepareNavigation(path);
+    try { window.location.href = target; return true; } catch (e) {}
+    return false;
+  }
+
+  function restoreHref(node, href, target) {
+    try {
+      if (href === null) node.removeAttribute('href'); else node.setAttribute('href', href);
+      if (target === null) node.removeAttribute('target'); else node.setAttribute('target', target);
+    } catch (e) {}
+  }
+
+  function activateWebPathFromElement(element, path) {
+    if (!element || !path) return false;
+    var hrefNode = closestHrefNode(element) || element;
+    if (!hrefNode || !hrefNode.setAttribute) return false;
+
+    var originalHref = hrefNode.getAttribute('href');
+    var originalTarget = hrefNode.getAttribute('target');
+    log('spa click: ' + path.slice(0, 80));
+    prepareNavigation(path);
+
+    try {
+      hrefNode.setAttribute('href', path);
+      hrefNode.removeAttribute('target');
+      fireClick(hrefNode);
+      setTimeout(function () { restoreHref(hrefNode, originalHref, originalTarget); }, 1500);
+      return true;
+    } catch (e) {
+      restoreHref(hrefNode, originalHref, originalTarget);
+      return false;
+    }
+  }
+
+  function routeWebPathWithoutReload(path) {
+    if (!path) return false;
+    log('spa route: ' + path.slice(0, 80));
+    prepareNavigation(path);
+    try {
+      window.history.pushState({}, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+      window.dispatchEvent(new CustomEvent('yt-navigate-finish'));
+      onNavigate();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  var APP_RE = /itunes\\.apple\\.com|apps\\.apple\\.com|youtubemusic:\\/\\/|music\\.apple\\.com/i;
+  var SCHEME_RE = /^(youtubemusic|itms-apps|itms|com\\.google\\.ios\\.youtubemusic):\\/\\//i;
+
+  function onAppLinkClick(event) {
+    var node = event.target;
+    while (node && node !== document) {
+      var href = node.getAttribute && node.getAttribute('href');
+      if (href && (APP_RE.test(href) || SCHEME_RE.test(href))) {
+        event.preventDefault();
+        event.stopPropagation();
+        log('app link blocked: ' + href.slice(0, 80));
+        var web = webEquivalent(href);
+        if (web) activateWebPathFromElement(node, web) || routeWebPathWithoutReload(web);
+        return;
+      }
+      node = node.parentElement;
+    }
+  }
+
+  // location.assign / replace 在 WebKit 里不可改写（旧版对它们的改写实际不生效，已删除）
+  function blockAppRedirects() {
+    window.open = function (target, name, features) {
+      if (target && (APP_RE.test(String(target)) || SCHEME_RE.test(String(target)))) {
+        var web = webEquivalent(target);
+        if (web) navigateToWebPath(web);
+        return null;
+      }
+      return NATIVE.open ? NATIVE.open.call(window, target, name, features) : null;
+    };
+    listen(document, 'click', onAppLinkClick, true);
+  }
+
+  // 按文字隐藏“打开应用”按钮（按选择器的已由 CSS 处理）。
+  // 2 秒一次、用 textContent：旧版每轮都对所有按钮读 innerText，会反复触发重排，很耗电
+  var OPEN_APP_TEXT = /^(open app|打开应用|開啟應用程式|アプリを開く)$/i;
+  function hideAppPrompts() {
+    var now = Date.now();
+    if (now - state.lastPromptScan < 2000) return;
+    state.lastPromptScan = now;
+    var buttons = document.querySelectorAll('a,button,tp-yt-paper-button,yt-button-renderer');
+    for (var j = 0; j < buttons.length; j++) {
+      var b = buttons[j];
+      var text = (b.textContent || b.getAttribute('aria-label') || '').trim();
+      if (text.length < 20 && OPEN_APP_TEXT.test(text)) {
+        b.style.setProperty('display', 'none', 'important');
+        b.style.setProperty('pointer-events', 'none', 'important');
+      }
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     点击修复：有些列表项在 WebView 里点了没反应，隔一会儿补点一次
+     ══════════════════════════════════════════════════════════ */
+
+  function bindMobileTapFix() {
+    ['touchstart', 'pointerdown'].forEach(function (type) {
+      listen(window, type, rememberTapPoint, true);
+    });
+    ['touchend', 'pointerup', 'click'].forEach(function (type) {
+      listen(window, type, onMobileTap, true);
+    });
+  }
+
+  function rememberTapPoint(event) {
+    var point = getEventPoint(event);
+    if (!point) return;
+    state.lastTapPoint = { x: point.clientX, y: point.clientY, clientX: point.clientX, clientY: point.clientY, time: Date.now() };
+  }
+
+  // 用来判断“补点”前页面有没有反应：地址、音源、页面结构。
+  // 旧版包含播放进度，播放中进度一直在变，导致补点永远不会触发。
+  function samePageState() {
+    var video = getVideo();
+    return [
+      location.href,
+      video && (video.currentSrc || video.src || ''),
+      document.querySelectorAll('tp-yt-paper-dialog, ytmusic-menu-popup-renderer, tp-yt-iron-dropdown').length
+    ].join('|');
+  }
+
+  function onMobileTap(event) {
+    if (!event || event.__ytClearScriptableMusicTapFix || event.__ytClearScriptableMusicTapSeen) return;
+    event.__ytClearScriptableMusicTapSeen = true;
+
+    var point = getEventPoint(event);
+    var target = point ? document.elementFromPoint(point.clientX, point.clientY) : null;
+    target = target || event.target;
+    if (!target || target === document || isPlayerControlTap(target)) return;
+
+    var link = closestHrefNode(target);
+    if (link) {
+      var href = link.getAttribute('href') || '';
+      var web = webEquivalent(href);
+      if (web && isNativeAppHref(href)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        log('tap native link: ' + href.slice(0, 80));
+        activateWebPathFromElement(link, web) || routeWebPathWithoutReload(web);
+        return;
+      }
+      if (web) {
+        log('tap web link: ' + href.slice(0, 80));
+        prepareNavigation(web);
+        return;
+      }
+    }
+
+    if (event.type !== 'touchend' && event.type !== 'pointerup') return;
+    var item = closestMusicItem(target) || nearestActionContainer(target);
+    if (!item || item.__ytClearTapFixUntil > Date.now()) return;
+
+    var before = samePageState();
+    item.__ytClearTapFixUntil = Date.now() + TAP_FALLBACK_DELAY + 700;
+    setTimeout(function () {
+      if (!document.contains(item) || samePageState() !== before) return;
+      var action = findItemAction(item) || item;
+      if (!action || isPlayerControlTap(action)) return;
+      log('tap fallback: ' + item.tagName.toLowerCase());
+      var actionHref = action.getAttribute && action.getAttribute('href');
+      var actionWeb = webEquivalent(actionHref);
+      if (actionWeb) {
+        activateWebPathFromElement(action, actionWeb) || routeWebPathWithoutReload(actionWeb);
+        return;
+      }
+      try {
+        var synthetic = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+        synthetic.__ytClearScriptableMusicTapFix = true;
+        action.dispatchEvent(synthetic);
+      } catch (e) {
+        try { action.click(); } catch (e2) {}
+      }
+    }, TAP_FALLBACK_DELAY);
+  }
+
+  function getEventPoint(event) {
+    var touch = event.changedTouches && event.changedTouches[0];
+    if (touch) return touch;
+    if (typeof event.clientX === 'number' && typeof event.clientY === 'number' && (event.clientX || event.clientY)) return event;
+    if (state.lastTapPoint && Date.now() - state.lastTapPoint.time < 1200) return state.lastTapPoint;
+    return null;
+  }
+
+  function closestHrefNode(node) {
+    while (node && node !== document) {
+      if (node.getAttribute && node.getAttribute('href')) return node;
+      node = node.parentElement || node.parentNode;
+    }
+    return null;
+  }
+
+  var MUSIC_ITEM_SEL = [
+    'ytmusic-responsive-list-item-renderer',
+    'ytmusic-two-row-item-renderer',
+    'ytmusic-carousel-shelf-basic-header-renderer',
+    'ytmusic-grid-renderer ytmusic-card-shelf-renderer',
+    'ytmusic-card-shelf-renderer',
+    'ytmusic-playlist-shelf-renderer ytmusic-responsive-list-item-renderer',
+    '[role="listitem"]',
+    '[data-testid*="song"]',
+    '[data-testid*="playlist"]'
+  ].join(',');
+
+  function closestMusicItem(node) {
+    while (node && node !== document) {
+      if (node.matches && node.matches(MUSIC_ITEM_SEL)) return node;
+      node = node.parentElement || node.parentNode;
+    }
+    return null;
+  }
+
+  function nearestActionContainer(node) {
+    var current = node;
+    var depth = 0;
+    while (current && current !== document && depth < 8) {
+      if (findItemAction(current)) return current;
+      if (current.getAttribute && (
+        current.getAttribute('role') === 'button' ||
+        current.getAttribute('role') === 'listitem' ||
+        current.getAttribute('aria-label')
+      )) return current;
+      current = current.parentElement || current.parentNode;
+      depth++;
+    }
+    return null;
+  }
+
+  var ITEM_ACTION_SEL = [
+    'a[href^="youtubemusic://"]',
+    'a[href*="watch"]',
+    'a[href*="playlist"]',
+    'a[href*="browse"]',
+    'a[href]',
+    'ytmusic-play-button-renderer',
+    '.play-button',
+    '#play-button',
+    '#thumbnail',
+    '.title',
+    '[role="button"]',
+    'button'
+  ];
+
+  function findItemAction(item) {
+    for (var i = 0; i < ITEM_ACTION_SEL.length; i++) {
+      var node = item.querySelector && item.querySelector(ITEM_ACTION_SEL[i]);
+      if (node && !isOverflowMenu(node)) return node;
+    }
+    return null;
+  }
+
+  var PLAYER_CONTROL_SEL = [
+    'ytmusic-player-bar',
+    'ytmusic-app-layout > [slot="player-bar"]',
+    'input',
+    'textarea',
+    'select',
+    'ytmusic-menu-renderer',
+    'ytmusic-search-box',
+    'ytmusic-pivot-bar-renderer',
+    'ytmusic-nav-bar',
+    '#ytm-debug-overlay'
+  ].join(',');
+
+  function isPlayerControlTap(node) {
+    var current = node;
+    while (current && current !== document) {
+      if (current.matches && current.matches(PLAYER_CONTROL_SEL)) return true;
+      current = current.parentElement || current.parentNode;
+    }
+    return false;
+  }
+
+  function isOverflowMenu(node) {
+    var label = (node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('title'))) || '';
+    return /more|menu|更多|选项|選項/i.test(label);
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     播放器 / 音频元素
+     ══════════════════════════════════════════════════════════ */
+
+  function getPlayer() {
+    if (!state.player || !document.contains(state.player)) {
+      state.player = document.querySelector('#movie_player, .html5-video-player');
+      if (state.player) patchPlayerMethods(state.player);
+    }
+    return state.player;
+  }
+
+  function patchPlayerMethods(player) {
+    if (!player || player.__ytClearScriptableMusicPlayerPatch === VERSION) return;
+    player.__ytClearScriptableMusicPlayerPatch = VERSION;
+    state.patchedPlayers.push(player);
+
+    function wrap(name, make) {
+      var key = '__ytClearNative_' + name;
+      var nativeMethod = player[key] || player[name];   // 取原版，避免包装旧版本的包装
+      if (typeof nativeMethod !== 'function') return;
+      player[key] = nativeMethod;
+      player[name] = make(nativeMethod);
+    }
+
+    ['pauseVideo', 'stopVideo'].forEach(function (name) {
+      wrap(name, function (nativeMethod) {
+        return function () {
+          if (!shouldAllowPause(name)) { softResume(80); return undefined; }
+          return nativeMethod.apply(player, arguments);
+        };
+      });
+    });
+
+    wrap('playVideo', function (nativeMethod) {
+      return function () {
+        if (!shouldAllowPagePlay('playVideo')) return undefined;
+        clearUserPaused();
+        return nativeMethod.apply(player, arguments);
+      };
+    });
+
+    // 切歌：属于正常的播放过渡
+    ['loadVideoById', 'loadVideoByUrl', 'loadPlaylist', 'nextVideo', 'previousVideo'].forEach(function (name) {
+      wrap(name, function (nativeMethod) {
+        return function () {
+          clearUserPaused();
+          state.interrupted = false;
+          markTransition();
+          return nativeMethod.apply(player, arguments);
+        };
+      });
+    });
+  }
+
+  function findVideo() {
+    return document.querySelector('#movie_player video') ||
+           document.querySelector('.html5-video-player video') ||
+           document.querySelector('video');
+  }
+
+  function getVideo() {
+    if (!state.video || !document.contains(state.video)) {
+      state.video = findVideo();
+      var v = state.video;
+      if (v && v.__ytClearMusicBound !== VERSION) {
+        v.__ytClearMusicBound = VERSION;
+        log('video bound');
+        v.setAttribute('playsinline', '');
+        v.setAttribute('webkit-playsinline', '');
+        listen(v, 'playing', onVideoPlaying, { passive: true });
+        listen(v, 'play', onVideoPlaying, { passive: true });
+        listen(v, 'pause', onVideoPause, true);
+        listen(v, 'loadstart', onVideoLoadStart, { passive: true });
+        listen(v, 'emptied', onVideoLoadStart, { passive: true });
+        listen(v, 'waiting', onVideoGap, { passive: true });
+        listen(v, 'ended', onVideoGap, { passive: true });
+        listen(v, 'canplay', onVideoCanPlay, { passive: true });
+        listen(v, 'seeked', onVideoSeeked, { passive: true });
+        listen(v, 'durationchange', scheduleBurst, { passive: true });
+        listen(v, 'ratechange', trackContentState, { passive: true });
+        listen(v, 'volumechange', trackContentState, { passive: true });
+        listen(v, 'webkitpresentationmodechanged', onPresentationModeChanged, { passive: true });
+      }
+    }
+    return state.video;
+  }
+
+  function inNativePlayer(v) {
+    if (!v) return false;
+    if (v.webkitDisplayingFullscreen) return true;
+    var mode = v.webkitPresentationMode;
+    return mode === 'fullscreen' || mode === 'picture-in-picture';
+  }
+
+  function isInPiP(v) {
+    return !!v && v.webkitPresentationMode === 'picture-in-picture';
+  }
+
+  function onPresentationModeChanged(event) {
+    var v = event && event.target;
+    log('presentation ' + (v && v.webkitPresentationMode));
+    applyKeepAlivePolicy('presentation');
+  }
+
+  function onVideoPlaying() {
+    log('playing');
+    if (state.interrupted) {
+      state.interrupted = false;
+      state.resumeAfterInterruption = false;
+      log('interruption ended: playing');
+    }
+    if (!state.playingSince) state.playingSince = Date.now();
+    state.transitionUntil = 0;
+    clearUserPaused();
+    state.mediaSessionBound = false;
+    applyKeepAlivePolicy('playing');
+    if (state.pendingUnmute) {
+      setTimeout(function () {
+        if (isBackground()) return;
+        state.pendingUnmute = false;
+        var video = getVideo();
+        if (video && !state.inAd && !state.touchedMute) video.muted = false;
+      }, 250);
+    }
+    scheduleBurst();
+    updateMediaSession();
+  }
+
+  function isNearEnd(v) {
+    return v && Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 1.5;
+  }
+
+  /* ─── 暂停事件：所有暂停都会到这里（包括系统造成的） ─── */
+  function onVideoPause(event) {
+    var video = (event && event.target) || getVideo();
+    state.playingSince = 0;
+    if (!video || video.ended || isNearEnd(video)) { applyKeepAlivePolicy('track end'); return; }  // 一首播完，交给 YT Music 切歌
+    if (state.inAd) return;
+    if (Date.now() < state.transitionUntil) return;
+    if (state.userPaused || state.interrupted) { updateMediaSession(); applyKeepAlivePolicy('pause'); return; }
+
+    // 1) 原生全屏 / 画中画里：网页收不到触摸，暂停来自系统控件
+    if (inNativePlayer(video)) {
+      setUserPaused('native player');
+      updateMediaSession();
+      return;
+    }
+
+    // 2) 前台、非手势：拔耳机、来电、YT Music 自己暂停……尊重它
+    if (!isBackground()) {
+      acceptForegroundPause('system (foreground)', false);
+      updateMediaSession();
+      applyKeepAlivePolicy('pause');
+      return;
+    }
+
+    // 3) 在后台待了一会儿才出现的暂停：被别的 App 打断（微信语音、来电）→ 让出声音
+    if (backgroundFor() > BG_SETTLED) {
+      beginInterruption('pause in background');
+      updateMediaSession();
+      return;
+    }
+
+    // 4) 刚切到后台时系统造成的暂停 → 恢复
+    log('pause while backgrounded -> resume');
+    applyKeepAlivePolicy('bg pause');
+    if (state.shouldResume) {
+      syncResume();
+      softResume(120);
+      softResume(800);
+    }
+  }
+
+  function markTransition() {
+    state.transitionUntil = Date.now() + 2500;
+    state.mediaSessionBound = false;
+    scheduleBurst();
+  }
+
+  function onVideoLoadStart() {
+    markTransition();
+    onVideoGap();
+  }
+
+  // 切歌间隙 / 缓冲：音乐暂时没声音，需要保活音频撑住，免得 App 在后台被挂起
+  function onVideoGap() {
+    state.playingSince = 0;
+    applyKeepAlivePolicy('gap');
+  }
+
+  function onVideoCanPlay() {
+    state.transitionUntil = 0;
+    if (state.shouldResume && !state.userPaused && !state.inAd && !state.interrupted) softResume(0);
+  }
+
+  function onVideoSeeked() {
+    updatePositionState(getVideo());
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     恢复播放
+     ══════════════════════════════════════════════════════════ */
+
+  function canAutoResume() {
+    return !state.userPaused && !state.inAd && !state.interrupted;
+  }
+
+  function syncResume() {
+    var video = state.video || getVideo();
+    if (!video || !canAutoResume()) return;
+    if (!video.paused || video.ended) return;
+    try {
+      var promise = NATIVE.play.call(video);
+      if (promise && promise.catch) {
+        promise.catch(function (error) { log('sync resume blocked ' + (error && error.name)); });
+      }
+    } catch (e) {}
+  }
+
+  function blessGesture() {
+    var video = getVideo();
+    if (!video) return;
+    try {
+      var promise = NATIVE.play.call(video);
+      if (promise && promise.catch) promise.catch(function () {});
+    } catch (e) {}
+  }
+
+  function attemptPlay(video) {
+    if (isBackground()) log('resume attempt (background)');
+    var promise;
+    try { promise = NATIVE.play.call(video); } catch (e) { return; }
+    if (!promise || !promise.catch) return;
+    promise.catch(function (error) {
+      log('play blocked ' + (error && error.name) + (isBackground() ? ' (bg)' : ''));
+      if (isBackground()) return;
+      if (video.muted || state.inAd || state.userPaused) return;
+      // 自动播放被拦：先静音播放，回到前台后再取消静音
+      state.pendingUnmute = true;
+      video.muted = true;
+      var retry;
+      try { retry = NATIVE.play.call(video); } catch (e) { retry = null; }
+      if (retry && retry.catch) {
+        retry.catch(function () {
+          state.pendingUnmute = false;
+          video.muted = false;
+        });
+      }
+    });
+  }
+
+  function softResume(delay) {
+    setTimeout(function () {
+      var video = getVideo();
+      if (!video || !canAutoResume()) return;
+      if (Date.now() < state.transitionUntil) return;
+      if (video.paused && !video.ended) attemptPlay(video);
+      updateMediaSession();
+    }, delay || 0);
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     锁屏 / 控制中心（Media Session）
+     ══════════════════════════════════════════════════════════ */
+
+  // 每个动作单独 try：某个动作不被支持时，不影响其他动作注册
+  function setMediaAction(name, handler) {
+    try { navigator.mediaSession.setActionHandler(name, handler); }
+    catch (e) { log('ms unsupported ' + name); }
+  }
+
+  function updateMediaSession() {
+    if (!navigator.mediaSession) return;
+    var mediaVideo = state.video;
+    try {
+      navigator.mediaSession.playbackState =
+        (mediaVideo && !mediaVideo.paused && !mediaVideo.ended) ? 'playing' : 'paused';
+    } catch (e) {}
+    updatePositionState(mediaVideo);
+
+    if (state.mediaSessionBound && Date.now() - state.lastMediaSessionRefresh < 3000) return;
+    state.mediaSessionBound = true;
+    state.lastMediaSessionRefresh = Date.now();
+
+    setMediaAction('play', function () {
+      log('ms play');
+      state.interrupted = false;
+      state.resumeAfterInterruption = false;
+      clearUserPaused();
+      startAudioKeepAlive();
+      blessGesture();
+      softResume(150);
+    });
+    setMediaAction('pause', function () {
+      log('ms pause');
+      var video = getVideo();
+      state.allowPauseUntil = Date.now() + 1500;
+      setUserPaused('lock screen');
+      if (video) { try { NATIVE.pause.call(video); } catch (e) {} }
+      updateMediaSession();
+    });
+    setMediaAction('previoustrack', previousTrack);
+    setMediaAction('nexttrack', nextTrack);
+    // 保持为 null：设置了快退/快进，iOS 锁屏会把“上一首/下一首”换成 ±10 秒按钮
+    setMediaAction('seekbackward', null);
+    setMediaAction('seekforward', null);
+    setMediaAction('seekto', function (details) {
+      if (!details || typeof details.seekTime !== 'number') return;
+      log('ms seekto');
+      seekTo(details.seekTime);
+    });
+  }
+
+  function rebindMediaSession() {
+    state.mediaSessionBound = false;
+    updateMediaSession();
+  }
+
+  function updatePositionState(video) {
+    if (!navigator.mediaSession || typeof navigator.mediaSession.setPositionState !== 'function') return;
+    if (!video || state.inAd) return;
+    var duration = video.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    var position = Math.min(Math.max(video.currentTime || 0, 0), duration);
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: duration,
+        playbackRate: video.playbackRate || 1,
+        position: position
+      });
+    } catch (e) {}
+  }
+
+  function startTrackChange() {
+    state.interrupted = false;
+    state.resumeAfterInterruption = false;
+    clearUserPaused();
+    markTransition();
+    startAudioKeepAlive();
+    blessGesture();
+  }
+
+  function nextTrack() {
+    log('ms next');
+    startTrackChange();
+    if (
+      clickFirst([
+        'ytmusic-player-bar .next-button',
+        'ytmusic-player-bar tp-yt-paper-icon-button.next-button',
+        'ytmusic-player-bar button.next-button',
+        'ytmusic-player-bar [aria-label*="Next" i]',
+        'ytmusic-player-bar [title*="Next" i]',
+        'ytmusic-player-bar [aria-label*="下一"]',
+        'ytmusic-player-bar [title*="下一"]',
+        '.next-button',
+        '[aria-label*="Next song" i]',
+        '[aria-label*="Next track" i]'
+      ]) ||
+      callPlayerMethod(['nextVideo', 'nextTrack', 'next']) ||
+      sendShortcut('N', true)
+    ) {
+      afterMediaCommand();
+    }
+  }
+
+  function previousTrack() {
+    log('ms prev');
+    startTrackChange();
+    if (
+      clickFirst([
+        'ytmusic-player-bar .previous-button',
+        'ytmusic-player-bar tp-yt-paper-icon-button.previous-button',
+        'ytmusic-player-bar button.previous-button',
+        'ytmusic-player-bar [aria-label*="Previous" i]',
+        'ytmusic-player-bar [title*="Previous" i]',
+        'ytmusic-player-bar [aria-label*="上一"]',
+        'ytmusic-player-bar [title*="上一"]',
+        '.previous-button',
+        '[aria-label*="Previous song" i]',
+        '[aria-label*="Previous track" i]'
+      ]) ||
+      callPlayerMethod(['previousVideo', 'previousTrack', 'previous']) ||
+      sendShortcut('P', true)
+    ) {
+      afterMediaCommand();
+    }
+  }
+
+  // 拖动锁屏进度条：暂停中拖动保持暂停，播放中拖动继续播放
+  function seekTo(seconds) {
+    var video = getVideo();
+    if (callPlayerMethod(['seekTo'], [seconds, true])) {
+      afterMediaCommand();
+      return;
+    }
+    if (video && Number.isFinite(video.duration)) {
+      try { video.currentTime = Math.max(0, Math.min(video.duration, seconds)); } catch (e) {}
+    }
+    afterMediaCommand();
+  }
+
+  function afterMediaCommand() {
+    rebindMediaSession();
+    softResume(120);
+    softResume(900);
+    scheduleBurst();
+  }
+
+  function callPlayerMethod(methods, args) {
+    var player = getPlayer();
+    if (!player) return false;
+    args = args || [];
+    for (var i = 0; i < methods.length; i++) {
+      if (typeof player[methods[i]] === 'function') {
+        try { player[methods[i]].apply(player, args); return true; } catch (e) {}
+      }
+    }
+    return false;
+  }
+
+  function clickFirst(selectors) {
+    for (var i = 0; i < selectors.length; i++) {
+      var button = null;
+      try { button = document.querySelector(selectors[i]); } catch (e) {}
+      if (isUsableControl(button)) {
+        fireClick(button);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isUsableControl(button) {
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    if (button.matches && button.matches('[disabled]')) return false;
+    return true;
+  }
+
+  // 只点一次：旧版 click() 之后又派发了一个 click 事件，锁屏“下一首”会连跳两首
+  function fireClick(target) {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(function (type) {
+      try { target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+    });
+    try { target.click(); } catch (e) {}
+  }
+
+  function sendShortcut(key, shiftKey) {
+    var target = document.activeElement || document.body || document.documentElement;
+    var upper = key.toUpperCase();
+    try {
+      ['keydown', 'keyup'].forEach(function (type) {
+        target.dispatchEvent(new KeyboardEvent(type, {
+          key: key,
+          code: 'Key' + upper,
+          keyCode: upper.charCodeAt(0),
+          which: upper.charCodeAt(0),
+          shiftKey: !!shiftKey,
+          bubbles: true,
+          cancelable: true
+        }));
+      });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     保活音频：几乎无声的振荡器，让 App 在后台不被挂起
+     只在需要时运行：
+       · 前台、刚进后台、切歌间隙、缓冲中、用户暂停（10 分钟内，方便从锁屏继续）→ 运行
+       · 后台稳定播放中、被打断中、画中画中 → 停掉
+     后台播放时一直占着音频会话，会让 iOS 在微信语音开始后很快把音乐恢复、打断语音。
+     ══════════════════════════════════════════════════════════ */
+
+  function keepAliveWanted() {
+    var v = state.video;
+    if (state.interrupted) return false;
+    if (isInPiP(v)) return false;
+    if (state.userPaused) return Date.now() - state.userPausedAt < KEEPALIVE_IDLE_STOP;
+    if (!isBackground()) return true;
+    if (backgroundFor() < BG_KEEPALIVE_WINDOW) return true;
+    var playingSteadily = v && !v.paused && !v.ended && state.playingSince &&
+      Date.now() - state.playingSince > KEEPALIVE_PLAYING_OFF;
+    return !playingSteadily;
+  }
+
+  function applyKeepAlivePolicy(reason) {
+    var want = keepAliveWanted();
+    if (want && !state.keepAliveOsc) {
+      startAudioKeepAlive();
+      if (state.keepAliveOsc) log('keep-alive on (' + reason + ')');
+    } else if (!want && state.keepAliveOsc) {
+      stopAudioKeepAlive();
+      log('keep-alive off (' + reason + ')');
+    }
+  }
+
+  function startAudioKeepAlive() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!state.audioCtx) {
+      try { state.audioCtx = new AC(); } catch (e) { return; }
+      try { listen(state.audioCtx, 'statechange', onAudioStateChange); } catch (e) {}
+    }
+    if (!keepAliveWanted()) return;
+
+    if (state.audioCtx.state !== 'running') {
+      try {
+        var p = state.audioCtx.resume();
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) {}
+    }
+    if (!state.keepAliveOsc) {
+      try {
+        var gain = state.audioCtx.createGain();
+        gain.gain.value = 0.0001;
+        var osc = state.audioCtx.createOscillator();
+        osc.frequency.value = 30;
+        osc.connect(gain);
+        gain.connect(state.audioCtx.destination);
+        osc.start();
+        state.keepAliveOsc = osc;
+        state.keepAliveGain = gain;
+      } catch (e) {}
+    }
+    if (!state.silenceTimer) {
+      state.silenceTimer = setInterval(function () {
+        if (!keepAliveWanted()) return;   // 被打断时不去抢音频会话
+        if (state.audioCtx && state.audioCtx.state !== 'running') {
+          try {
+            var p2 = state.audioCtx.resume();
+            if (p2 && p2.catch) p2.catch(function () {});
+          } catch (e) {}
+        }
+      }, 1500);
+    }
+  }
+
+  function stopAudioKeepAlive() {
+    if (state.silenceTimer) { clearInterval(state.silenceTimer); state.silenceTimer = null; }
+    if (state.keepAliveOsc) {
+      try { state.keepAliveOsc.stop(); } catch (e) {}
+      try { state.keepAliveOsc.disconnect(); } catch (e) {}
+      state.keepAliveOsc = null;
+    }
+    if (state.keepAliveGain) {
+      try { state.keepAliveGain.disconnect(); } catch (e) {}
+      state.keepAliveGain = null;
+    }
+    if (state.audioCtx && state.audioCtx.state === 'running') {
+      try {
+        var p = state.audioCtx.suspend();
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) {}
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     广告
+     强信号（播放器 ad-showing / 可见的跳过按钮）才会静音、快进、拖到结尾；
+     弱信号（页面里有广告容器）只隐藏元素 —— 容器残留时不会误伤正常歌曲
+     ══════════════════════════════════════════════════════════ */
+
+  function isVisibleButton(button) {
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+    try {
+      var rect = button.getBoundingClientRect();
+      var style = window.getComputedStyle(button);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+        style.visibility !== 'hidden' && style.opacity !== '0';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function findSkipButton() {
+    for (var i = 0; i < skipSelectors.length; i++) {
+      var button = null;
+      try { button = document.querySelector(skipSelectors[i]); } catch (e) {}
+      if (isVisibleButton(button)) return button;
+    }
+    return null;
+  }
+
+  function adSignal() {
+    var player = getPlayer();
+    if (player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting'))) return 'strong';
+    if (findSkipButton()) return 'strong';
+    var container = document.querySelector('ytmusic-ad-instream-ads-renderer,.ytp-ad-player-overlay,.ytp-ad-preview-container');
+    if (container && container.childElementCount > 0) return 'weak';
+    return '';
+  }
+
+  function handleAds() {
+    var signal = adSignal();
+    if (signal) {
+      if (!state.inAd) {
+        state.inAd = true;
+        log('ad start (' + signal + ', restore to ' + state.contentRate + 'x' + (state.contentMuted ? ' muted' : '') + ')');
+      }
+      hideAdElements();
+      if (signal === 'strong') {
+        if (!clickSkip() && Date.now() >= state.cooldownUntil) {
+          finishShortAd();
+          muteAd();
+          speedUpAd();
+        }
+      }
+      scheduleBurst();
+    } else if (state.inAd && Date.now() > state.cooldownUntil) {
+      state.inAd = false;
+      log('ad end');
+      restorePlayback();
+      rebindMediaSession();
+      softResume(120);
+    }
+  }
+
+  function clickSkip() {
+    var now = Date.now();
+    if (now - state.lastSkipClick < 350) return false;
+    var button = findSkipButton();
+    if (!button) return false;
+    state.lastSkipClick = now;
+    state.cooldownUntil = now + 700;
+    try { button.click(); } catch (e) {}
+    log('ad skip');
+    return true;
+  }
+
+  function finishShortAd() {
+    var video = getVideo();
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0 || video.duration > 90 || video.ended) return;
+    if (video.duration - video.currentTime > 0.35) {
+      try {
+        video.currentTime = Math.max(0, video.duration - 0.1);
+        state.cooldownUntil = Date.now() + 500;
+      } catch (e) {}
+    }
+  }
+
+  function muteAd() {
+    var video = getVideo();
+    if (video && !video.muted) {
+      state.touchedMute = true;
+      video.muted = true;
+    }
+  }
+
+  function speedUpAd() {
+    var video = getVideo();
+    if (video && video.playbackRate < 16) {
+      state.touchedRate = true;
+      try { video.playbackRate = 16; } catch (e) {}
+    }
+  }
+
+  function hideAdElements() {
+    for (var i = 0; i < adElementSelectors.length; i++) {
+      var nodes = document.querySelectorAll(adElementSelectors[i]);
+      for (var j = 0; j < nodes.length; j++) {
+        nodes[j].style.setProperty('display', 'none', 'important');
+        nodes[j].style.setProperty('visibility', 'hidden', 'important');
+        nodes[j].style.setProperty('opacity', '0', 'important');
+      }
+    }
+  }
+
+  // 只撤销我们自己改的：16 倍速恢复成正片时的倍速，静音恢复成正片时的状态
+  function restorePlayback() {
+    var video = getVideo();
+    if (video) {
+      try { if (state.touchedRate && video.playbackRate > 4) video.playbackRate = state.contentRate || 1; } catch (e) {}
+      try { if (state.touchedMute) video.muted = state.contentMuted; } catch (e) {}
+    }
+    state.touchedRate = false;
+    state.touchedMute = false;
+  }
+
+  // 记住正片时用户自己的倍速和静音（广告期间、我们改过时不更新）
+  function trackContentState() {
+    var v = state.video;
+    if (!v || state.inAd || state.touchedRate || state.touchedMute) return;
+    if (v.playbackRate > 0 && v.playbackRate <= 4) state.contentRate = v.playbackRate;
+    if (!state.pendingUnmute) state.contentMuted = !!v.muted;
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     “还在听吗？”等确认弹窗
+     按钮一般只写“是 / Yes”，所以按弹窗整体的文字匹配，再点里面最后一个可见按钮
+     ══════════════════════════════════════════════════════════ */
+
+  var STILL_LISTENING = /still watching|still listening|still there|continue watching|continue listening|video paused|music paused|仍在观看|還在觀看|继续观看|繼續觀看|继续播放|繼續播放|继续收听|繼續收聽|还在听|還在聽|还在吗|還在嗎/i;
+
+  function dismissDialogs() {
+    var now = Date.now();
+    if (now - state.lastDialogCheck < 1500) return;
+    state.lastDialogCheck = now;
+
+    var dialogs = document.querySelectorAll(
+      'ytmusic-you-there-renderer, tp-yt-paper-dialog, yt-confirm-dialog-renderer, [role="dialog"], [role="alertdialog"]'
+    );
+    for (var i = 0; i < dialogs.length; i++) {
+      var d = dialogs[i];
+      if (!STILL_LISTENING.test(d.textContent || '')) continue;
+      var btns = d.querySelectorAll('button, tp-yt-paper-button, yt-button-renderer');
+      for (var j = btns.length - 1; j >= 0; j--) {
+        if (isVisibleButton(btns[j])) {
+          log('dismiss dialog: ' + (d.textContent || '').trim().slice(0, 30));
+          try { btns[j].click(); } catch (e) {}
+          if (!isGenuineUserPause()) {
+            clearUserPaused();
+            softResume(200);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     主循环：广告时 / 切歌后 120ms 一次，平时 700ms 一次
+     DOM 变化只会“提前”触发一次（150ms 合并），不再每次变化都立刻跑一遍
+     ══════════════════════════════════════════════════════════ */
+
+  function tick() {
+    injectCSS();
+    trackHidden();
+    getVideo();
+    getPlayer();
+    hideAppPrompts();
+    dismissDialogs();
+    handleAds();
+    trackContentState();
+    updateMediaSession();
+    applyKeepAlivePolicy('tick');
+
+    if (state.shouldResume && canAutoResume()) {
+      var video = getVideo();
+      if (video && video.paused && !video.ended && Date.now() > state.transitionUntil) softResume(0);
+    }
+  }
+
+  function safeTick() {
+    try { tick(); } catch (e) { log('tick error ' + (e && e.message)); }
+  }
+
+  function scheduleBurst() {
+    state.burstUntil = Date.now() + 2500;
+  }
+
+  function startLoop() {
+    if (state.loopTimer) clearTimeout(state.loopTimer);
+    var loop = function () {
+      safeTick();
+      var delay = state.inAd || Date.now() < state.burstUntil ? 120 : 700;
+      state.loopTimer = setTimeout(loop, delay);
+    };
+    loop();
+  }
+
+  function onNavigate() {
+    restorePlayback();
+    state.video = null;
+    state.player = null;
+    state.inAd = false;
+    state.cooldownUntil = 0;
+    state.mediaSessionBound = false;
+    state.transitionUntil = Date.now() + 1500;
+    scheduleBurst();
+    safeTick();
+  }
+
+  function startObserver() {
+    if (!document.body || state.observer) return;
+    state.observer = new MutationObserver(function (mutations) {
+      if (state.observerTimer) return;
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i].addedNodes.length) {
+          state.observerTimer = setTimeout(function () {
+            state.observerTimer = null;
+            safeTick();
+          }, 150);
+          return;
+        }
+      }
+    });
+    state.observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     调试面板：屏幕左上角 1.6 秒内连点 4 下
+     （在 window 捕获阶段监听，YT Music 顶栏吞不掉）
+     ══════════════════════════════════════════════════════════ */
+
+  function onDebugTap(event) {
+    var touch = event.changedTouches && event.changedTouches[0];
+    if (!touch || touch.clientX > 90 || touch.clientY > 110) return;
+    var now = Date.now();
+    state.debugTaps = state.debugTaps.filter(function (t) { return now - t < 1600; });
+    state.debugTaps.push(now);
+    if (state.debugTaps.length >= 4) {
+      state.debugTaps = [];
+      toggleDebugOverlay();
+    }
+  }
+
+  function toggleDebugOverlay() {
+    var existing = document.getElementById('ytm-debug-overlay');
+    if (existing) {
+      existing.parentNode.removeChild(existing);
+      return;
+    }
+    var v = getVideo();
+    var panel = document.createElement('div');
+    panel.id = 'ytm-debug-overlay';
+    panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:60%;overflow:auto;background:rgba(0,0,0,0.94);color:#7CFC00;font:10px/1.5 monospace;z-index:2147483647;padding:10px;white-space:pre-wrap;-webkit-overflow-scrolling:touch;';
+
+    var bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;position:sticky;top:0;';
+    function btn(text, fn) {
+      var x = document.createElement('button');
+      x.textContent = text;
+      x.style.cssText = 'flex:1;padding:8px;border:none;border-radius:8px;background:#333;color:#fff;font-size:13px;';
+      x.addEventListener('touchend', function (e) { e.preventDefault(); e.stopPropagation(); fn(x); }, { passive: false });
+      return x;
+    }
+    var pre = document.createElement('div');
+    bar.appendChild(btn('复制日志', function (x) {
+      var text = pre.textContent;
+      function done(ok) { x.textContent = ok ? '已复制' : '复制失败，请截图'; }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+          return;
+        }
+      } catch (e) {}
+      done(false);
+    }));
+    bar.appendChild(btn('关闭', function () { if (panel.parentNode) panel.parentNode.removeChild(panel); }));
+    panel.appendChild(bar);
+    panel.appendChild(pre);
+
+    pre.textContent = 'v' + VERSION +
+      '  hidden=' + isReallyHidden() +
+      '  bg=' + state.realBackgrounded +
+      '  userPaused=' + state.userPaused +
+      '  interrupted=' + state.interrupted +
+      '  inAd=' + state.inAd +
+      '  keepAlive=' + !!state.keepAliveOsc +
+      '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') +
+      '  mode=' + ((v && v.webkitPresentationMode) || 'inline') + '\\n' +
+      state.logs.slice(-400).join('\\n');
+    document.body.appendChild(panel);
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     销毁：新版本注入时彻底清理旧实例
+     ══════════════════════════════════════════════════════════ */
+
+  function destroy() {
+    if (state.loopTimer) clearTimeout(state.loopTimer);
+    if (state.observerTimer) clearTimeout(state.observerTimer);
+    if (state.observer) state.observer.disconnect();
+
+    stopAudioKeepAlive();
+    if (state.audioCtx) {
+      try {
+        var closing = state.audioCtx.close();
+        if (closing && closing.catch) closing.catch(function () {});
+      } catch (e) {}
+      state.audioCtx = null;
+    }
+
+    listeners.forEach(function (l) {
+      try { l[0].removeEventListener(l[1], l[2], l[3]); } catch (e) {}
+    });
+    listeners.length = 0;
+
+    HTMLMediaElement.prototype.play = NATIVE.play;
+    HTMLMediaElement.prototype.pause = NATIVE.pause;
+    EventTarget.prototype.addEventListener = NATIVE.addEventListener;
+    window.open = NATIVE.open;
+
+    state.patchedPlayers.forEach(function (p) {
+      ['pauseVideo', 'stopVideo', 'playVideo', 'loadVideoById', 'loadVideoByUrl', 'loadPlaylist', 'nextVideo', 'previousVideo']
+        .forEach(function (name) {
+          var original = p['__ytClearNative_' + name];
+          if (original) p[name] = original;
+        });
+      try { delete p.__ytClearScriptableMusicPlayerPatch; } catch (e) {}
+    });
+    if (state.video) {
+      try { delete state.video.__ytClearMusicBound; } catch (e) {}
+    }
+
+    ['hidden', 'visibilityState', 'webkitHidden', 'webkitVisibilityState', 'hasFocus'].forEach(function (k) {
+      try { delete document[k]; } catch (e) {}
+    });
+
+    ['yt-clear-scriptable-music-css', 'ytm-debug-overlay'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    });
+
+    if (window.__ytClearScriptableMusic && window.__ytClearScriptableMusic.destroy === destroy) {
+      delete window.__ytClearScriptableMusic;
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     启动
+     ══════════════════════════════════════════════════════════ */
+
+  window.__ytClearScriptableMusic = { version: VERSION, destroy: destroy, logs: state.logs, state: state };
+
+  patchVisibility();
+  patchBackgroundEventRegistration();
+  patchMedia();
+  blockAppRedirects();
+  bindMobileTapFix();
+  injectCSS();
+  hideAppPrompts();
+  updateMediaSession();
+
+  listen(document, 'touchstart', markGesture, { passive: true });
+  listen(document, 'touchend', markGesture, { passive: true });
+  listen(window, 'touchend', onDebugTap, { capture: true, passive: true });
+  listen(document, 'click', markGesture, true);
+  listen(document, 'keydown', markGesture, true);
+
+  listen(window, 'yt-navigate-finish', onNavigate);
+  listen(window, 'yt-page-data-updated', onNavigate);
+  listen(window, 'load', onNavigate);
+
+  if (document.body) startObserver();
+  else listen(document, 'DOMContentLoaded', startObserver, { once: true });
+
+  getVideo();
+  getPlayer();
+  scheduleBurst();
+  startLoop();
+
+  return null;
+})();
+null;
+`;
+
+await webView.evaluateJavaScript(magicScript);
+
+// 页面整页刷新（例如“打开 App”链接改成网页打开）后，注入的代码会丢失。
+// 每 3 秒检查一次，没有就补注入；已经存在时只是一次很小的查询。
+const aliveCheck = "!!(window.__ytClearScriptableMusic && window.__ytClearScriptableMusic.version === '" + VERSION + "')";
+let reinjecting = false;
+const reinjectTimer = Timer.schedule(3000, true, async () => {
+  if (reinjecting) return;
+  reinjecting = true;
+  try {
+    const alive = await webView.evaluateJavaScript(aliveCheck);
+    if (!alive) await webView.evaluateJavaScript(magicScript);
+  } catch (e) {}
+  reinjecting = false;
+});
+
+await webView.present(true);
+reinjectTimer.invalidate();
+
+// 关闭后把本次日志存到 Scriptable 文件夹（文件 App → iCloud 云盘 / 我的 iPhone → Scriptable → yt-music-clear-log.txt）
+try {
+  const logText = await webView.evaluateJavaScript(
+    "(function(){var t=window.__ytClearScriptableMusic;return t&&t.logs?t.logs.join('\\n'):'';})()"
+  );
+  if (logText) {
+    let fm;
+    try { fm = FileManager.iCloud(); } catch (e) { fm = FileManager.local(); }
+    fm.writeString(fm.joinPath(fm.documentsDirectory(), 'yt-music-clear-log.txt'),
+      'v' + VERSION + '  ' + new Date().toString() + '\n' + logText);
+  }
+} catch (e) {}
+Script.complete();
+
+}
