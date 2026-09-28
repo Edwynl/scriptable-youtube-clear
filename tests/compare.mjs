@@ -61,6 +61,11 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test', before
       this.webkitPresentationMode = 'fullscreen';
       this.dispatchEvent(new Event('webkitbeginfullscreen'));
     };
+    HTMLVideoElement.prototype.webkitSetPresentationMode = function (mode) {
+      this.webkitPresentationMode = mode;
+      this.webkitDisplayingFullscreen = mode !== 'inline';
+      this.dispatchEvent(new Event('webkitpresentationmodechanged'));
+    };
     navigator.mediaSession = {
       setActionHandler(n, f){ window.__handlers[n] = f; },
       setPositionState(){}, playbackState: 'none'
@@ -109,7 +114,7 @@ const SCENARIOS = [
   { group: '暂停与续播', name: '全屏暂停 2 秒后锁屏', expect: '暂停', run: async (w, v) => {
       A.enterFS(w, v); A.sysPause(w, v); await sleep(2000); A.lock(w); await sleep(1500); return state(v); } },
   { group: '暂停与续播', name: '画中画里点暂停（App 在后台）', expect: '暂停', run: async (w, v) => {
-      A.lock(w); v.webkitPresentationMode = 'picture-in-picture'; await sleep(200); A.sysPause(w, v); await sleep(1500); return state(v); } },
+      A.toPiP(w, v, false); A.lock(w); await sleep(2500); A.sysPause(w, v); await sleep(1500); return state(v); } },
   { group: '后台播放', name: '切后台：先 blur，再被系统暂停', expect: '播放', run: async (w, v) => {
       A.blur(w); await sleep(50); A.sysPause(w, v); await sleep(1500); return state(v); } },
   { group: '后台播放', name: '切后台：系统暂停先到，50ms 后才进后台', expect: '播放', run: async (w, v) => {
@@ -165,12 +170,33 @@ const SCENARIOS = [
       return w.__fsCalls + ' 次'; } },
   { group: '画中画', name: '横屏全屏 → 画中画 → 回到页面，自动回到全屏', expect: '2 次', run: async (w, v) => {
       await sleep(200); A.landscape(w); await sleep(800);
-      A.toPiP(w, v, true); await sleep(1000); A.pipBackInline(w, v); await sleep(2000);
+      A.toPiP(w, v, true); await sleep(1000); A.pipBackInline(w, v); await sleep(3200);
       return w.__fsCalls + ' 次'; } },
   { group: '画中画', name: '同上，但系统没发 endfullscreen 事件', expect: '2 次', run: async (w, v) => {
       await sleep(200); A.landscape(w); await sleep(800);
-      A.toPiP(w, v, false); await sleep(1000); A.pipBackInline(w, v); await sleep(2000);
+      A.toPiP(w, v, false); await sleep(1000); A.pipBackInline(w, v); await sleep(3200);
       return w.__fsCalls + ' 次'; } },
+  { group: '画中画', name: '全屏最小化进入画中画时，YouTube 调用 pause()', expect: '播放', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.blur(w); A.toPiP(w, v, true); await sleep(50);
+      w.HTMLMediaElement.prototype.pause.call(v); await sleep(300); A.hide(w); await sleep(1500); return state(v); } },
+  { group: '画中画', name: '切换到画中画时，系统先暂停再切换', expect: '播放', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.blur(w); A.sysPause(w, v); await sleep(50); A.toPiP(w, v, true); await sleep(1500); return state(v); } },
+  { group: '画中画', name: '切换到画中画后，系统立刻暂停', expect: '播放', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.blur(w); A.toPiP(w, v, true); await sleep(100); A.sysPause(w, v); await sleep(1500); return state(v); } },
+  { group: '画中画', name: '画中画里网页 JS 想切回内联', expect: '画中画', run: async (w, v) => {
+      A.toPiP(w, v, false); await sleep(300);
+      w.HTMLVideoElement.prototype.webkitSetPresentationMode.call(v, 'inline'); await sleep(300);
+      return v.webkitPresentationMode === 'picture-in-picture' ? '画中画' : v.webkitPresentationMode; } },
+  { group: '画中画', name: '画中画里网页 JS 调用 webkitEnterFullscreen', expect: '画中画', run: async (w, v) => {
+      A.toPiP(w, v, false); await sleep(300);
+      w.HTMLVideoElement.prototype.webkitEnterFullscreen.call(v); await sleep(300);
+      return v.webkitPresentationMode === 'picture-in-picture' ? '画中画' : v.webkitPresentationMode; } },
+  { group: '画中画', name: '刚进画中画就在锁屏点暂停', expect: '暂停', run: async (w, v) => {
+      A.toPiP(w, v, false); A.lock(w); await sleep(300);
+      w.__handlers.pause && w.__handlers.pause(); await sleep(1500); return state(v); } },
   { group: '画中画', name: '去掉 YouTube 加的 disablepictureinpicture', expect: '已移除', run: async (w, v) => {
       v.setAttribute('disablepictureinpicture', ''); await sleep(1000);
       return v.hasAttribute('disablepictureinpicture') ? '仍存在' : '已移除'; } },

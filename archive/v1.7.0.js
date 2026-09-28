@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.7.1-scriptable';
+const VERSION = '1.7.0-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -45,17 +45,6 @@ const magicScript = `
     pause: HTMLMediaElement.prototype.pause,
     addEventListener: EventTarget.prototype.addEventListener
   });
-  // 画中画 / 全屏相关的原生方法（旧版本没存过，按需补上）
-  (function () {
-    var VP = window.HTMLVideoElement && HTMLVideoElement.prototype;
-    function keep(key, owner, name) {
-      if (!(key in NATIVE)) NATIVE[key] = owner && typeof owner[name] === 'function' ? owner[name] : null;
-    }
-    keep('setPresentationMode', VP, 'webkitSetPresentationMode');
-    keep('enterFullscreen', VP, 'webkitEnterFullscreen');
-    keep('exitFullscreen', VP, 'webkitExitFullscreen');
-    keep('exitPictureInPicture', Document.prototype, 'exitPictureInPicture');
-  })();
 
   // 真实的 document.hidden：下面 patchVisibility() 会把它伪装成 false，
   // 所以从原型链上取原始 getter 来读真实值
@@ -82,8 +71,6 @@ const magicScript = `
   }
 
   var BG_PAUSE_GRACE = 1000;               // 前台暂停后这么短时间内进入后台 → 其实是切后台造成的
-  var PIP_SETTLE = 2000;                   // 进入画中画后这么短时间内的暂停 → 过渡中系统造成的
-  var FS_QUIET_AFTER = 2000;               // blur / 离开画中画后这么久内不自动全屏
   var KEEPALIVE_IDLE_STOP = 10 * 60 * 1000; // 用户暂停超过 10 分钟 → 停掉保活音频省电
   var AD_SKIP_SEL = '.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,.ytp-ad-skip-button-container button';
 
@@ -129,10 +116,6 @@ const magicScript = `
     fsLastAttempt: 0,
     fsSuppressedKey: '',       // 用户在横屏时手动退出全屏的视频，不再拉回
     fsHoldUntil: 0,
-
-    pipSince: 0,               // 进入画中画的时间
-    lastPipEndAt: 0,           // 离开画中画的时间
-    lastBlurAt: 0,             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
 
     debugTaps: [],
     logs: []
@@ -265,8 +248,6 @@ const magicScript = `
     if (v.readyState < 1 || !(v.duration > 0)) return;      // 直播 duration 是 Infinity，也算
     var now = Date.now();
     if (now < state.fsHoldUntil) return;                     // 刚退出全屏，正在判断是不是手动退出
-    // 上滑回主屏幕、画中画开始 / 结束的过渡期里，窗口尺寸和播放模式都在变，别插手
-    if (now - state.lastBlurAt < FS_QUIET_AFTER || now - state.lastPipEndAt < FS_QUIET_AFTER) return;
 
     var key = currentVideoKey();
     if (state.fsSuppressedKey === key) return;               // 用户在横屏时手动退出了这个视频的全屏
@@ -668,7 +649,6 @@ const magicScript = `
     var type = (event && event.type) || 'unknown';
     var hidden = isReallyHidden();
     if (event && typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-    if (type === 'blur') state.lastBlurAt = Date.now();
 
     // visibilitychange 回到前台时也会触发
     if ((type === 'visibilitychange' || type === 'webkitvisibilitychange') && !hidden) {
@@ -745,77 +725,19 @@ const magicScript = `
      只在“真的在后台”时拦截；前台一律放行，由 onVideoPause 判断
      ══════════════════════════════════════════════════════════ */
 
-  function recentGesture() {
+  function shouldAllowPause(source) {
     var now = Date.now();
-    return now < state.recentGestureUntil || now < state.allowPauseUntil;
-  }
-
-  function shouldAllowPause(source, el) {
-    var now = Date.now();
-    if (recentGesture()) {
+    if (now < state.recentGestureUntil || now < state.allowPauseUntil) {
       setUserPaused(source + ' (user)');
       return true;
     }
     if (now < state.transitionUntil) return true;
     if (state.userPaused || !state.shouldResume) return true;
-    // 原生全屏 / 画中画里，用户的暂停来自系统控件，不经过网页 JS；
-    // 这时网页调 pause() 只可能是 YouTube 自己（比如检测到画中画就暂停）
-    if (inNativePlayer(el || state.video || findVideo())) {
-      log(source + ' blocked (native player)');
-      return false;
-    }
     if (isBackground()) {
       log(source + ' blocked (background)');
       return false;
     }
     return true;
-  }
-
-  /* ─── 不让网页 JS 把视频拉出画中画（用户在画中画里点的按钮是系统控件，不经过这里） ─── */
-  function isInPiP(v) {
-    return !!v && v.webkitPresentationMode === 'picture-in-picture';
-  }
-
-  function patchPresentation() {
-    var VP = window.HTMLVideoElement && HTMLVideoElement.prototype;
-    if (!VP) return;
-
-    if (NATIVE.setPresentationMode) {
-      VP.webkitSetPresentationMode = function (mode) {
-        if (isInPiP(this) && mode !== 'picture-in-picture' && !recentGesture()) {
-          log('page tried to leave PiP (' + mode + ') -> blocked');
-          return undefined;
-        }
-        return NATIVE.setPresentationMode.apply(this, arguments);
-      };
-    }
-    if (NATIVE.enterFullscreen) {
-      VP.webkitEnterFullscreen = function () {
-        if (isInPiP(this) && !recentGesture()) {
-          log('page tried to enter fullscreen from PiP -> blocked');
-          return undefined;
-        }
-        return NATIVE.enterFullscreen.apply(this, arguments);
-      };
-    }
-    if (NATIVE.exitFullscreen) {
-      VP.webkitExitFullscreen = function () {
-        if (isInPiP(this) && !recentGesture()) {
-          log('page tried to exit PiP via exitFullscreen -> blocked');
-          return undefined;
-        }
-        return NATIVE.exitFullscreen.apply(this, arguments);
-      };
-    }
-    if (NATIVE.exitPictureInPicture) {
-      Document.prototype.exitPictureInPicture = function () {
-        if (isInPiP(state.video || findVideo()) && !recentGesture()) {
-          log('page tried exitPictureInPicture -> blocked');
-          return Promise.resolve();
-        }
-        return NATIVE.exitPictureInPicture.apply(this, arguments);
-      };
-    }
   }
 
   function patchMedia() {
@@ -828,7 +750,7 @@ const magicScript = `
     };
 
     HTMLMediaElement.prototype.pause = function () {
-      if (this && this.tagName === 'VIDEO' && !shouldAllowPause('pause()', this)) {
+      if (this && this.tagName === 'VIDEO' && !shouldAllowPause('pause()')) {
         softResume(80);
         return undefined;
       }
@@ -933,23 +855,7 @@ const magicScript = `
 
   function onPresentationModeChanged(event) {
     var v = event && event.target;
-    var mode = v && v.webkitPresentationMode;
-    log('presentation ' + mode + (v && !v.paused ? ' playing' : ' paused'));
-
-    if (mode === 'picture-in-picture') {
-      state.pipSince = Date.now();
-      // 全屏 → 画中画的切换过程中出现的暂停，不是用户点的 → 撤销并恢复
-      if (state.fgPauseAt && state.fgPauseNative && Date.now() - state.fgPauseAt < BG_PAUSE_GRACE) {
-        log('pause was part of PiP transition -> revert');
-        clearUserPaused();
-        syncResume();
-        softResume(150);
-        softResume(700);
-      }
-    } else if (state.pipSince) {
-      state.pipSince = 0;
-      state.lastPipEndAt = Date.now();
-    }
+    log('presentation ' + (v && v.webkitPresentationMode));
   }
 
   // YouTube 可能给视频加 disablepictureinpicture，导致 iOS 不给画中画
@@ -1004,13 +910,7 @@ const magicScript = `
     if (inNativePlayer(video)) {
       var pip = video.webkitPresentationMode === 'picture-in-picture';
       if (pip) {
-        // 刚进入画中画：切换过程中系统可能暂停一下，恢复播放
-        if (state.pipSince && Date.now() - state.pipSince < PIP_SETTLE) {
-          log('pause right after PiP start -> resume');
-          if (state.shouldResume) { syncResume(); softResume(150); softResume(700); }
-          return;
-        }
-        // 之后画中画里的暂停，是用户点了小窗上的按钮
+        // 画中画小窗本来就是给后台用的，里面的暂停一定是用户点的
         setUserPaused('picture-in-picture');
         updateMediaSession();
         return;
@@ -1614,13 +1514,6 @@ const magicScript = `
     HTMLMediaElement.prototype.play = NATIVE.play;
     HTMLMediaElement.prototype.pause = NATIVE.pause;
     EventTarget.prototype.addEventListener = NATIVE.addEventListener;
-    if (window.HTMLVideoElement) {
-      var VP = HTMLVideoElement.prototype;
-      if (NATIVE.setPresentationMode) VP.webkitSetPresentationMode = NATIVE.setPresentationMode;
-      if (NATIVE.enterFullscreen) VP.webkitEnterFullscreen = NATIVE.enterFullscreen;
-      if (NATIVE.exitFullscreen) VP.webkitExitFullscreen = NATIVE.exitFullscreen;
-    }
-    if (NATIVE.exitPictureInPicture) Document.prototype.exitPictureInPicture = NATIVE.exitPictureInPicture;
 
     state.patchedPlayers.forEach(function (p) {
       ['pauseVideo', 'stopVideo'].forEach(function (name) {
@@ -1660,7 +1553,6 @@ const magicScript = `
   patchVisibility();
   patchBackgroundEventRegistration();
   patchMedia();
-  patchPresentation();
   writeQualityPref();
   ensureStyle();
   ensureUI();
