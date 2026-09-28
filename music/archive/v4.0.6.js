@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.7-scriptable';
+const VERSION = '4.0.6-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -143,7 +143,6 @@ const magicScript = `
     pendingUnmute: false,
 
     lastTapPoint: null,
-    touchMoved: false,         // 这次触摸有没有滑动（滑动松手不算点击，不补点）
     lastMediaEventAt: 0,       // 最近一次播放 / 暂停 / 切歌事件（判断点击有没有生效）
     lastPromptScan: 0,
     lastDialogCheck: 0,
@@ -819,8 +818,6 @@ const magicScript = `
     ['touchstart', 'pointerdown'].forEach(function (type) {
       listen(window, type, rememberTapPoint, true);
     });
-    listen(window, 'touchmove', onTouchMove, { capture: true, passive: true });
-    listen(window, 'scroll', onAnyScroll, { capture: true, passive: true });
     ['touchend', 'pointerup', 'click'].forEach(function (type) {
       listen(window, type, onMobileTap, true);
     });
@@ -829,29 +826,7 @@ const magicScript = `
   function rememberTapPoint(event) {
     var point = getEventPoint(event);
     if (!point) return;
-    if (event.type === 'touchstart' || !state.lastTapPoint || Date.now() - state.lastTapPoint.time > 800) {
-      state.touchMoved = false;   // 新的一次触摸
-    }
     state.lastTapPoint = { x: point.clientX, y: point.clientY, clientX: point.clientX, clientY: point.clientY, time: Date.now() };
-  }
-
-  // 手指移动超过 10 像素、或页面滚动过：这是滑动，不是点击
-  function onTouchMove(event) {
-    var t = (event.touches && event.touches[0]) || (event.changedTouches && event.changedTouches[0]);
-    var s0 = state.lastTapPoint;
-    if (!t || !s0) { state.touchMoved = true; return; }
-    if (Math.abs(t.clientX - s0.x) > 10 || Math.abs(t.clientY - s0.y) > 10) state.touchMoved = true;
-  }
-
-  function onAnyScroll() {
-    if (state.lastTapPoint && Date.now() - state.lastTapPoint.time < 1500) state.touchMoved = true;
-  }
-
-  // 刚才那次触摸是不是一次干净的点击（没滑动、没长按）
-  function wasCleanTap() {
-    var s0 = state.lastTapPoint;
-    if (!s0 || state.touchMoved) return false;
-    return Date.now() - s0.time < 700;
   }
 
   // 用来判断“补点”前页面有没有反应：地址、音源、页面结构。
@@ -894,9 +869,6 @@ const magicScript = `
     }
 
     if (event.type !== 'touchend' && event.type !== 'pointerup') return;
-    // 滑动列表后松手、长按：不是点击，不补点
-    // （v4.0.0 起补点在播放中也会触发，滑动时松手停在某一行上就会被“补点”，跳到专辑页、打断正在放的歌）
-    if (!wasCleanTap()) return;
     // 只对歌曲 / 歌单卡片补点。普通按钮（播放、暂停、喜欢、标签页）点了不会跳转，
     // 如果也补点，会把刚才的操作再做一次（例如刚暂停又被点回播放）
     var item = closestMusicItem(target);
@@ -912,7 +884,7 @@ const magicScript = `
       if (!document.contains(item) || samePageState() !== before) return;
       if (state.lastMediaEventAt > tappedAt) return;   // 已经开始播放 / 切歌，说明点击生效了
       if (state.lastLinkTapAt > tappedAt - 1000) return; // 同一次点击已经点到了链接
-      var action = fallbackActionFor(item);
+      var action = findItemAction(item) || item;
       if (!action || isPlayerControlTap(action)) return;
       log('tap fallback: ' + item.tagName.toLowerCase());
       var actionHref = action.getAttribute && action.getAttribute('href');
@@ -997,16 +969,6 @@ const magicScript = `
     '[role="button"]',
     'button'
   ];
-
-  // 补点时点哪里：歌曲行只点歌名链接或播放按钮，绝不点行里的歌手 / 专辑链接（否则会跳到专辑页）
-  function fallbackActionFor(item) {
-    var tag = item.tagName ? item.tagName.toLowerCase() : '';
-    if (tag === 'ytmusic-responsive-list-item-renderer') {
-      return item.querySelector('a[href*="watch"]') ||
-             item.querySelector('ytmusic-play-button-renderer, .play-button, #play-button') || null;
-    }
-    return findItemAction(item) || item;
-  }
 
   function findItemAction(item) {
     for (var i = 0; i < ITEM_ACTION_SEL.length; i++) {

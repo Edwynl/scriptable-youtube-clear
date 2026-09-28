@@ -106,6 +106,19 @@ const A = {
   pagePause:(w, v) => w.HTMLMediaElement.prototype.pause.call(v),
 };
 const st = v => (v.paused ? '暂停' : '播放');
+// 模拟一次触摸：按下 →（可选）滑动 → 离开
+function touch(w, el, x, y, moveToY) {
+  const mk = (type, cx, cy) => {
+    const e = new w.Event(type, { bubbles: true, cancelable: true });
+    const t = [{ clientX: cx, clientY: cy }];
+    Object.defineProperty(e, 'touches', { value: type === 'touchend' ? [] : t });
+    Object.defineProperty(e, 'changedTouches', { value: t });
+    return e;
+  };
+  el.dispatchEvent(mk('touchstart', x, y));
+  if (moveToY !== undefined) el.dispatchEvent(mk('touchmove', x, moveToY));
+  el.dispatchEvent(mk('touchend', x, moveToY !== undefined ? moveToY : y));
+}
 const ctxOf = w => w.__ctxs[w.__ctxs.length - 1];
 const ctxOn = w => { const c = ctxOf(w); return c && c.state === 'running'; };
 const setAudio = (w, s) => { const c = ctxOf(w); if (!c) return; c.state = s; c.dispatchEvent(new w.Event('statechange')); };
@@ -204,7 +217,7 @@ const SCENARIOS = [
       item.innerHTML = '<a class="thumb" href="/playlist?list=PL1"></a><div class="title">歌单</div>';
       w.document.body.appendChild(item);
       let n = 0; item.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
-      item.querySelector('.title').dispatchEvent(new w.Event('touchend', { bubbles: true })); await sleep(1000);
+      touch(w, item.querySelector('.title'), 50, 300); await sleep(1000);
       return '补点 ' + n + ' 次'; } },
   { name: '真机日志复现：切到后台 1 秒多就点开微信语音，也不抢', expect: '暂停，抢 0 次', run: async (w, v) => {
       A.blur(w); await sleep(800); return grabText(await interruptFor(w, v, 3000, false)); } },
@@ -229,6 +242,20 @@ const SCENARIOS = [
   { name: '正常播放不会被误判为卡住', expect: '无误修', run: async (w, v) => {
       await sleep(5000); const logs = w.__ytClearScriptableMusic.logs || [];
       return logs.some(l => l.indexOf('repair') >= 0 || l.indexOf('stalled') >= 0) ? '误修' : '无误修'; } },
+  { name: '滑动列表后松手停在歌曲行上，不会跳到专辑页', expect: '没跳转', run: async (w, v) => {
+      const row = w.document.createElement('ytmusic-responsive-list-item-renderer');
+      row.innerHTML = '<div class="title">歌名</div><a class="artist" href="/browse/UCartist">歌手</a><a class="album" href="/browse/MPREalbum">专辑</a>';
+      w.document.body.appendChild(row);
+      let n = 0; row.querySelectorAll('a').forEach(a => a.addEventListener('click', e => { n++; e.preventDefault(); }));
+      touch(w, row.querySelector('.title'), 50, 400, 250);        // 手指往上滑了 150 像素
+      await sleep(1200); return n ? '跳到专辑 / 歌手页' : '没跳转'; } },
+  { name: '点歌曲行空白处（行里只有歌手 / 专辑链接），不会跳到专辑页', expect: '没跳转', run: async (w, v) => {
+      const row = w.document.createElement('ytmusic-responsive-list-item-renderer');
+      row.innerHTML = '<div class="title">歌名</div><a class="artist" href="/browse/UCartist">歌手</a><a class="album" href="/browse/MPREalbum">专辑</a>';
+      w.document.body.appendChild(row);
+      let n = 0; row.querySelectorAll('a').forEach(a => a.addEventListener('click', e => { n++; e.preventDefault(); }));
+      touch(w, row.querySelector('.title'), 50, 400);
+      await sleep(1200); return n ? '跳到专辑 / 歌手页' : '没跳转'; } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
