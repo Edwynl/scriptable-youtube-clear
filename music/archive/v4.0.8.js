@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.9-scriptable';
+const VERSION = '4.0.8-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -673,36 +673,9 @@ const magicScript = `
     };
   }
 
-  function markGesture(event) {
+  function markGesture() {
     state.recentGestureUntil = Date.now() + 1300;
     if (!state.userPaused) startAudioKeepAlive();
-    if (event && (event.type === 'touchend' || event.type === 'click')) blessMediaInGesture();
-  }
-
-  /* ─── 让锁屏 / 控制中心的“正在播放”在暂停后保留 ───
-     WebKit 规定：媒体至少要有一次在“用户手势”里被 play()，暂停后才继续留在锁屏 / 控制中心。
-     从链接点歌时 YT Music 是异步开始播放的，不算手势 → 第一次在控制中心暂停后，“正在播放”
-     就退回成系统“音乐”App，点播放没反应；在 App 里亲手点过一次播放后才正常。
-     所以在用户的点击里，对“正在播放”的媒体调一次 play()（本来就在放，不影响声音）。 */
-  function blessMediaInGesture() {
-    var v = state.video || findVideo();
-    if (v && !v.paused && !v.ended) { blessMedia(v); return; }
-    // 刚点了歌、还没开始播：WebKit 会把手势延续到 1 秒内的定时器里
-    setTimeout(function () {
-      var v2 = state.video || findVideo();
-      if (v2 && !v2.paused && !v2.ended) blessMedia(v2);
-    }, 900);
-  }
-
-  function blessMedia(v) {
-    try {
-      var p = NATIVE.play.call(v);
-      if (p && p.catch) p.catch(function () {});
-    } catch (e) { return; }
-    if (v.__ytClearBlessed !== VERSION) {
-      v.__ytClearBlessed = VERSION;
-      log('media blessed in user gesture (keeps lock screen / Control Center after pause)');
-    }
   }
 
   /* ══════════════════════════════════════════════════════════

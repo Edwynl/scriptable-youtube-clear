@@ -271,6 +271,22 @@ const SCENARIOS = [
       let n = 0; li.querySelector('a').addEventListener('click', e => { n++; e.preventDefault(); });
       touch(w, li.querySelector('.t'), 60, 500);
       await sleep(1200); return n ? '跳转了' : '没跳转'; } },
+  { name: '播放中点一下屏幕：在手势里补一次播放（控制中心暂停后仍能继续）', expect: '已补，仍在播', run: async (w, v) => {
+      await sleep(300); const p0 = w.__plays;
+      touch(w, w.document.body, 200, 300); await sleep(300);
+      const logs = w.__ytClearScriptableMusic.logs;
+      return (w.__plays > p0 && logs.some(l => l.indexOf('media blessed') >= 0) ? '已补' : '未补') + '，' + (v.paused ? '暂停了' : '仍在播'); } },
+  { name: '点歌后 1 秒内才开始播放，也在同一次点击里补上', expect: '已补', run: async (w, v) => {
+      A.touch(w); A.pagePause(w, v); await sleep(1500);      // 先处于暂停
+      w.__ytClearScriptableMusic.logs.length = 0;
+      touch(w, w.document.body, 200, 300);                   // 点歌
+      await sleep(400); A.sysPlay(w, v);                     // YT Music 异步开始播放
+      await sleep(900);
+      return w.__ytClearScriptableMusic.logs.some(l => l.indexOf('media blessed') >= 0) ? '已补' : '未补'; } },
+  { name: '暂停时点屏幕，音乐不会自己响起来', expect: '仍暂停', run: async (w, v) => {
+      A.touch(w); A.pagePause(w, v); await sleep(1500);
+      touch(w, w.document.body, 200, 300); await sleep(1500);
+      return v.paused ? '仍暂停' : '响了'; } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
