@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.7.0-scriptable';
+const VERSION = '1.6.0-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -105,17 +105,12 @@ const magicScript = `
     allowPauseUntil: 0,
     transitionUntil: 0,
     realBackgrounded: false,
+    nativeFullscreen: false,
     pendingUnmute: false,
 
     lastHD: 0,
     lastStillCheck: 0,
     lastLandscape: window.innerWidth > window.innerHeight,
-
-    fsAttemptKey: '',          // 横屏自动全屏：当前视频、尝试次数、上次尝试时间
-    fsAttempts: 0,
-    fsLastAttempt: 0,
-    fsSuppressedKey: '',       // 用户在横屏时手动退出全屏的视频，不再拉回
-    fsHoldUntil: 0,
 
     debugTaps: [],
     logs: []
@@ -212,51 +207,28 @@ const magicScript = `
   }
 
   /* ══════════════════════════════════════════════════════════
-     横屏 = 全屏（和 YouTube App 一样）
-     iOS 只有在视频处于原生全屏时，切到后台才会自动进入画中画，
-     所以横屏时要可靠地保持全屏：视频没加载好会重试、先横屏再开视频也会全屏、
-     直播也算；只有用户在横屏时手动退出全屏，这个视频才不再拉回。
+     横屏自动全屏：只在“竖屏 → 横屏”那一刻触发一次，且只在播放页
      ══════════════════════════════════════════════════════════ */
 
-  function isLandscapeNow() {
-    return window.innerWidth > window.innerHeight;
-  }
-
   function isWatchPage() {
-    var p = location.pathname;
-    return p.indexOf('/watch') === 0 || p.indexOf('/live/') === 0;
-  }
-
-  function currentVideoKey() {
-    try { return new URLSearchParams(location.search).get('v') || location.pathname; }
-    catch (e) { return location.pathname; }
+    return location.pathname.indexOf('/watch') === 0;
   }
 
   // 视频是否在 iOS 原生全屏 / 画中画里（此时网页收不到触摸事件）
-  // 只看视频元素的实时属性，不自己记标记：标记在“全屏 → 画中画 → 回到页面”时容易过期
   function inNativePlayer(v) {
+    if (state.nativeFullscreen) return true;
     if (!v) return false;
     if (v.webkitDisplayingFullscreen) return true;
     var mode = v.webkitPresentationMode;
     return mode === 'fullscreen' || mode === 'picture-in-picture';
   }
 
-  function ensureLandscapeFullscreen(reason) {
-    if (!isLandscapeNow() || !isWatchPage() || isReallyHidden()) return;
+  function tryFullscreen() {
     var v = getVideo();
-    if (!v || inNativePlayer(v)) return;
-    if (v.readyState < 1 || !(v.duration > 0)) return;      // 直播 duration 是 Infinity，也算
-    var now = Date.now();
-    if (now < state.fsHoldUntil) return;                     // 刚退出全屏，正在判断是不是手动退出
-
-    var key = currentVideoKey();
-    if (state.fsSuppressedKey === key) return;               // 用户在横屏时手动退出了这个视频的全屏
-    if (state.fsAttemptKey !== key) { state.fsAttemptKey = key; state.fsAttempts = 0; }
-    if (state.fsAttempts >= 3) return;                       // 连续失败就别一直试
-    if (now - state.fsLastAttempt < 1500) return;
-    state.fsLastAttempt = now;
-    state.fsAttempts++;
-    log('fullscreen attempt ' + state.fsAttempts + ' (' + reason + ')');
+    if (!v || !isWatchPage()) return;
+    if (!(window.innerWidth > window.innerHeight)) return;   // 这段时间里又转回竖屏了
+    if (v.readyState < 1 || !Number.isFinite(v.duration) || v.duration <= 0) return;
+    if (inNativePlayer(v)) return;
 
     if (typeof v.webkitEnterFullscreen === 'function') {
       try { v.webkitEnterFullscreen(); } catch (e) { log('fullscreen failed ' + (e && e.name)); }
@@ -269,16 +241,10 @@ const magicScript = `
   }
 
   function onOrientationChange() {
-    var isLandscape = isLandscapeNow();
+    var isLandscape = window.innerWidth > window.innerHeight;
     if (isLandscape === state.lastLandscape) return;
     state.lastLandscape = isLandscape;
-    state.fsAttempts = 0;
-    state.fsLastAttempt = 0;
-    if (!isLandscape) {
-      state.fsSuppressedKey = '';     // 转回竖屏：下次横屏重新自动全屏
-      return;
-    }
-    setTimeout(function () { ensureLandscapeFullscreen('rotate'); }, 200);
+    if (isLandscape) setTimeout(tryFullscreen, 200);
   }
 
   function scheduleOrientationCheck() {
@@ -663,11 +629,7 @@ const magicScript = `
     }
 
     var hardBg = hidden || type === 'pagehide' || type === 'freeze';
-    var bgVideo = state.video || findVideo();
-    // 记下切后台那一刻视频的状态：mode=fullscreen 才会自动画中画
-    log('bg ' + type + (hardBg ? ' (hidden)' : '') +
-      ' mode=' + ((bgVideo && bgVideo.webkitPresentationMode) || 'inline') +
-      (bgVideo && !bgVideo.paused ? ' playing' : ' paused'));
+    log('bg ' + type + (hardBg ? ' (hidden)' : ''));
     state.realBackgrounded = true;
 
     // 刚被当作暂停的前台暂停，其实是切后台造成的 → 撤销
@@ -810,7 +772,6 @@ const magicScript = `
         log('video bound');
         v.setAttribute('playsinline', '');
         v.setAttribute('webkit-playsinline', '');
-        allowPictureInPicture(v);
         listen(v, 'playing', onVideoPlaying, { passive: true });
         listen(v, 'play', onVideoPlaying, { passive: true });
         listen(v, 'pause', onVideoPause, true);
@@ -828,55 +789,25 @@ const magicScript = `
   }
 
   function onNativeFullscreenBegin() {
+    state.nativeFullscreen = true;
     // 进入全屏时的 blur 可能刚把 realBackgrounded 设成 true，按真实状态校正
     state.realBackgrounded = isReallyHidden();
-    state.fsAttempts = 0;
     log('fullscreen begin');
     rebindMediaSession();
   }
 
   function onNativeFullscreenEnd() {
+    state.nativeFullscreen = false;
     state.realBackgrounded = isReallyHidden();
     log('fullscreen end');
     var v = state.video || findVideo();
     if (v && !v.paused) clearUserPaused();
     rebindMediaSession();
-
-    // 判断是不是用户在横屏时手动退出：等一下再看，
-    // 如果变成了画中画 / 切到了后台 / 转回了竖屏，都不算
-    state.fsHoldUntil = Date.now() + 600;
-    setTimeout(function () {
-      var vv = state.video || findVideo();
-      if (!vv || inNativePlayer(vv) || isReallyHidden() || !isLandscapeNow()) return;
-      state.fsSuppressedKey = currentVideoKey();
-      log('manual fullscreen exit in landscape -> stay inline for this video');
-    }, 400);
   }
 
   function onPresentationModeChanged(event) {
     var v = event && event.target;
     log('presentation ' + (v && v.webkitPresentationMode));
-  }
-
-  // YouTube 可能给视频加 disablepictureinpicture，导致 iOS 不给画中画
-  function allowPictureInPicture(v) {
-    if (!v) return;
-    try {
-      if (v.hasAttribute('disablepictureinpicture')) {
-        v.removeAttribute('disablepictureinpicture');
-        log('removed disablepictureinpicture');
-      }
-      if (v.disablePictureInPicture) v.disablePictureInPicture = false;
-    } catch (e) {}
-  }
-
-  function pipSupported(v) {
-    try {
-      return !!(v && typeof v.webkitSupportsPresentationMode === 'function' &&
-        v.webkitSupportsPresentationMode('picture-in-picture'));
-    } catch (e) {
-      return false;
-    }
   }
 
   function onVideoPlaying() {
@@ -1417,8 +1348,6 @@ const magicScript = `
     dismissStillWatching();
     updateMediaSession();
     maybeStopKeepAlive();
-    allowPictureInPicture(state.video);
-    ensureLandscapeFullscreen('tick');
 
     if (state.shouldResume && !state.userPaused && !state.inAd) {
       var video = getVideo();
@@ -1443,6 +1372,7 @@ const magicScript = `
   function onNavigate() {
     state.video = null;
     state.player = null;
+    state.nativeFullscreen = false;
     state.mediaSessionBound = false;
     state.transitionUntil = Date.now() + 1500;
     // 不重置 inAd：广告中途切走时，下一轮循环还要恢复静音和倍速
@@ -1477,8 +1407,7 @@ const magicScript = `
     panel.id = 'ytm-debug-overlay';
     panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:55%;overflow:auto;background:rgba(0,0,0,0.92);color:#7CFC00;font:10px/1.5 monospace;z-index:2147483647;padding:10px;white-space:pre-wrap;-webkit-overflow-scrolling:touch;';
     panel.textContent = 'v' + VERSION +
-      '  mode=' + ((v && v.webkitPresentationMode) || 'inline') +
-      '  pip=' + (pipSupported(v) ? 'yes' : 'no') +
+      '  fs=' + inNativePlayer(v) +
       '  hidden=' + isReallyHidden() +
       '  bg=' + state.realBackgrounded +
       '  userPaused=' + state.userPaused +

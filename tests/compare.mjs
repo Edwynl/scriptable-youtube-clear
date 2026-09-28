@@ -17,7 +17,7 @@ const files = process.argv.slice(2).length
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ─── 模拟环境 ─── */
-async function makePage(code, url = 'https://m.youtube.com/watch?v=test') {
+async function makePage(code, url = 'https://m.youtube.com/watch?v=test', before) {
   const dom = new JSDOM(
     '<!doctype html><html><head></head><body><ytm-app>' +
     '<div id="movie_player" class="html5-video-player"><video class="html5-main-video"></video></div>' +
@@ -37,8 +37,8 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test') {
     var P = HTMLMediaElement.prototype;
     Object.defineProperty(P, 'paused',       { get(){ return this.__p !== false; }, configurable: true });
     Object.defineProperty(P, 'ended',        { get(){ return false; }, configurable: true });
-    Object.defineProperty(P, 'readyState',   { get(){ return 4; }, configurable: true });
-    Object.defineProperty(P, 'duration',     { get(){ return 300; }, configurable: true });
+    Object.defineProperty(P, 'readyState',   { get(){ return this.__notReady ? 0 : 4; }, configurable: true });
+    Object.defineProperty(P, 'duration',     { get(){ return this.__dur !== undefined ? this.__dur : 300; }, configurable: true });
     Object.defineProperty(P, 'currentTime',  { get(){ return this.__t || 0; }, set(v){ this.__t = v; }, configurable: true });
     Object.defineProperty(P, 'muted',        { get(){ return !!this.__m; }, set(v){ this.__m = !!v; }, configurable: true });
     Object.defineProperty(P, 'playbackRate', { get(){ return this.__r || 1; }, set(v){ this.__r = v; }, configurable: true });
@@ -58,6 +58,7 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test') {
     HTMLVideoElement.prototype.webkitEnterFullscreen = function () {
       window.__fsCalls++;
       this.webkitDisplayingFullscreen = true;
+      this.webkitPresentationMode = 'fullscreen';
       this.dispatchEvent(new Event('webkitbeginfullscreen'));
     };
     navigator.mediaSession = {
@@ -65,6 +66,7 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test') {
       setPositionState(){}, playbackState: 'none'
     };
   `);
+  if (before) before(w);
   const errors = [];
   w.addEventListener('error', e => errors.push(e.message));
   w.eval(code);
@@ -78,8 +80,15 @@ const A = {
   blur:    w => w.dispatchEvent(new w.FocusEvent('blur')),
   hide:    w => { w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange')); },
   lock:    w => { A.blur(w); A.hide(w); },
-  enterFS: (w, v) => { v.webkitDisplayingFullscreen = true; v.dispatchEvent(new w.Event('webkitbeginfullscreen')); },
-  exitFS:  (w, v) => { v.webkitDisplayingFullscreen = false; v.dispatchEvent(new w.Event('webkitendfullscreen')); },
+  enterFS: (w, v) => { v.webkitDisplayingFullscreen = true; v.webkitPresentationMode = 'fullscreen'; v.dispatchEvent(new w.Event('webkitbeginfullscreen')); },
+  exitFS:  (w, v) => { v.webkitDisplayingFullscreen = false; v.webkitPresentationMode = 'inline'; v.dispatchEvent(new w.Event('webkitendfullscreen')); },
+  toPiP:   (w, v, withEnd) => {
+    v.webkitDisplayingFullscreen = false; v.webkitPresentationMode = 'picture-in-picture';
+    if (withEnd) v.dispatchEvent(new w.Event('webkitendfullscreen'));
+    v.dispatchEvent(new w.Event('webkitpresentationmodechanged'));
+  },
+  pipBackInline: (w, v) => { v.webkitPresentationMode = 'inline'; v.dispatchEvent(new w.Event('webkitpresentationmodechanged')); },
+  portrait: w => { w.__vw = 430; w.__vh = 932; w.dispatchEvent(new w.Event('resize')); },
   sysPause:(w, v) => w.__sysPause.call(v),
   userPlay:(w, v) => w.HTMLMediaElement.prototype.play.call(v),
   landscape: w => { w.__vw = 932; w.__vh = 430; w.dispatchEvent(new w.Event('resize')); },
@@ -142,6 +151,29 @@ const SCENARIOS = [
       await sleep(200); A.landscape(w); await sleep(800);
       A.exitFS(w, v); w.dispatchEvent(new w.Event('resize')); await sleep(1500);
       return w.__fsCalls + ' 次'; } },
+  { group: '横屏全屏', name: '先横屏再打开视频，自动全屏', expect: '1 次',
+    before: w => { w.__vw = 932; w.__vh = 430; },
+    run: async (w, v) => { await sleep(1500); return w.__fsCalls + ' 次'; } },
+  { group: '横屏全屏', name: '视频没加载好就转横屏，加载好后自动全屏', expect: '1 次', run: async (w, v) => {
+      v.__notReady = true; await sleep(200); A.landscape(w); await sleep(900);
+      v.__notReady = false; await sleep(1800); return w.__fsCalls + ' 次'; } },
+  { group: '横屏全屏', name: '直播（时长无限）转横屏自动全屏', expect: '1 次', run: async (w, v) => {
+      v.__dur = Infinity; await sleep(200); A.landscape(w); await sleep(1200); return w.__fsCalls + ' 次'; } },
+  { group: '横屏全屏', name: '手动退出后转回竖屏再横屏，重新全屏', expect: '2 次', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.exitFS(w, v); await sleep(1000); A.portrait(w); await sleep(600); A.landscape(w); await sleep(1200);
+      return w.__fsCalls + ' 次'; } },
+  { group: '画中画', name: '横屏全屏 → 画中画 → 回到页面，自动回到全屏', expect: '2 次', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.toPiP(w, v, true); await sleep(1000); A.pipBackInline(w, v); await sleep(2000);
+      return w.__fsCalls + ' 次'; } },
+  { group: '画中画', name: '同上，但系统没发 endfullscreen 事件', expect: '2 次', run: async (w, v) => {
+      await sleep(200); A.landscape(w); await sleep(800);
+      A.toPiP(w, v, false); await sleep(1000); A.pipBackInline(w, v); await sleep(2000);
+      return w.__fsCalls + ' 次'; } },
+  { group: '画中画', name: '去掉 YouTube 加的 disablepictureinpicture', expect: '已移除', run: async (w, v) => {
+      v.setAttribute('disablepictureinpicture', ''); await sleep(1000);
+      return v.hasAttribute('disablepictureinpicture') ? '仍存在' : '已移除'; } },
   { group: '其他', name: '首页横屏不全屏（预览视频）', url: 'https://m.youtube.com/', expect: '0 次', run: async (w, v) => {
       await sleep(200); A.landscape(w); await sleep(1200); return w.__fsCalls + ' 次'; } },
   { group: '其他', name: 'destroy() 还原所有补丁', expect: '已还原', run: async (w, v) => {
@@ -158,7 +190,7 @@ async function runFile(file) {
   const code = extractInjected(file);
   new Function(code);
   return Promise.all(SCENARIOS.map(async s => {
-    const { w, v, errors } = await makePage(code, s.url);
+    const { w, v, errors } = await makePage(code, s.url, s.before);
     v.play();
     await sleep(300);
     let got;

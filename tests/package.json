@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node compare.mjs && node smoke.mjs",
-    "compare": "node compare.mjs ../archive/v1.4.0-original.js ../archive/v1.5.0-claude.js ../archive/v1.5.0-codex.js ../YouTubeClear.js"
+    "compare": "node compare.mjs ../archive/v1.4.0-original.js ../archive/v1.5.0-claude.js ../archive/v1.5.0-codex.js ../archive/v1.6.0.js ../YouTubeClear.js"
   },
   "devDependencies": {
     "jsdom": "^24.1.3"
