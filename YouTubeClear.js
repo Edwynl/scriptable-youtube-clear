@@ -2,6 +2,8 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
+const VERSION = '1.5.0-scriptable';
+
 if (!config.runsInApp) {
   const alert = new Alert();
   alert.title = '需要在 Scriptable App 内运行';
@@ -25,14 +27,52 @@ await webView.loadURL(url);
 const magicScript = `
 (function() {
 
-  var VERSION = '1.4.0-scriptable';
+  var VERSION = '${VERSION}';
   var previous = window.__ytClearScriptableTube;
   if (previous && previous.version === VERSION) return null;
-  if (previous && typeof previous.destroy === 'function') previous.destroy();
+  if (previous && typeof previous.destroy === 'function') {
+    try { previous.destroy(); } catch (e) {}
+  }
+
+  /* ─── 原生方法只保存一次：重复注入时不会层层包装 ─── */
+  var NATIVE = window.__ytClearNatives || (window.__ytClearNatives = {
+    play: HTMLMediaElement.prototype.play,
+    pause: HTMLMediaElement.prototype.pause,
+    addEventListener: EventTarget.prototype.addEventListener
+  });
+
+  /* ─── 真实的页面可见性 ───
+     patchVisibility() 会把 document.hidden 伪装成 false，
+     这里直接调用 Document.prototype 上的原始 getter 读取真实值 */
+  var nativeHiddenGetter = null;
+  try {
+    var hiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+    nativeHiddenGetter = hiddenDesc && hiddenDesc.get;
+  } catch (e) {}
+
+  function isReallyHidden() {
+    try { return nativeHiddenGetter ? !!nativeHiddenGetter.call(document) : false; }
+    catch (e) { return false; }
+  }
+
+  /* 视频是否处于 iOS 原生全屏 / 画中画（此时网页收不到任何 touch 事件） */
+  function inNativePlayer(v) {
+    if (!v) return false;
+    if (v.webkitDisplayingFullscreen) return true;
+    var mode = v.webkitPresentationMode;
+    return mode === 'fullscreen' || mode === 'picture-in-picture';
+  }
+
+  /* ─── 统一登记监听器，destroy() 时全部移除 ─── */
+  var listeners = [];
+  function listen(target, type, fn, opts) {
+    NATIVE.addEventListener.call(target, type, fn, opts);
+    listeners.push([target, type, fn, opts]);
+  }
 
   /* ─── 国际化 ─── */
   var lang = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
-  var isCN = lang.startsWith('zh');
+  var isCN = lang.indexOf('zh') === 0;
   var I18N = {
     title:       isCN ? '搜索 YouTube'    : 'Search YouTube',
     placeholder: isCN ? '输入搜索内容...' : 'Search...',
@@ -83,7 +123,13 @@ const magicScript = `
     '.yt-pb:first-child{border-radius:0 12px 0 0!important;}',
     '.yt-pb:last-child{border-radius:0 0 12px 0!important;border-bottom:none!important;}',
     '.yt-pb:active{background:rgba(255,255,255,0.25)!important;}',
-    '.yt-pb svg{width:22px!important;height:22px!important;display:block!important;}'
+    '.yt-pb svg{width:22px!important;height:22px!important;display:block!important;}',
+
+    /* 横屏隐藏顶栏和侧边面板：交给 CSS，不再用 JS 每 300ms 改样式 */
+    '@media (orientation: landscape){',
+      '#yt-top-bar,#yt-panel{display:none!important;}',
+      'ytm-app{padding-top:0!important;}',
+    '}'
   ].join('');
 
   /* ─── SVG 图标 ─── */
@@ -101,84 +147,88 @@ const magicScript = `
     (document.head || document.documentElement).appendChild(s);
   }
 
-  /* ─── 横屏自动全屏 ─── */
+  /* ─── 横屏自动全屏 ───
+     只在「竖屏 → 横屏」那一刻触发一次。
+     旧版每 300ms 都会调用，导致横屏时手动退出全屏会被立刻拉回去。 */
+  var lastLandscape = window.innerWidth > window.innerHeight;
+
+  function isWatchPage() {
+    return location.pathname.indexOf('/watch') === 0;
+  }
+
   function tryFullscreen() {
-    var v = document.querySelector('video');
-    if (!v) return;
-    // 仅在有视频内容播放时触发（避免主页横屏误触发）
-    if (v.readyState < 1 || v.duration === 0) return;
-    if (v.webkitDisplayingFullscreen) return; // 已经全屏则跳过
+    var v = getVideo();
+    if (!v || !isWatchPage()) return;                     // 首页的预览视频不全屏
+    if (!(window.innerWidth > window.innerHeight)) return; // 这 200ms 内又转回了竖屏
+    if (v.readyState < 1 || !(v.duration > 0)) return;
+    if (inNativePlayer(v)) return;
     if (typeof v.webkitEnterFullscreen === 'function') {
-      try { v.webkitEnterFullscreen(); } catch(e) {}
+      try { v.webkitEnterFullscreen(); } catch (e) { log('fs failed ' + (e && e.name)); }
     } else if (typeof v.requestFullscreen === 'function') {
-      try { v.requestFullscreen(); } catch(e) {}
+      try { v.requestFullscreen(); } catch (e) {}
     }
   }
 
-  function applyOrientation() {
+  function onOrientationChange() {
     var isLandscape = window.innerWidth > window.innerHeight;
-    var bar   = document.getElementById('yt-top-bar');
-    var panel = document.getElementById('yt-panel');
-    var app   = document.querySelector('ytm-app');
-    if (isLandscape) {
-      if (bar)   bar.style.setProperty('display','none','important');
-      if (panel) panel.style.setProperty('display','none','important');
-      if (app)   app.style.setProperty('padding-top','0','important');
-      // 延迟一帧等视频元素稳定
-      setTimeout(tryFullscreen, 200);
-    } else {
-      if (bar)   bar.style.removeProperty('display');
-      if (panel) panel.style.removeProperty('display');
-      if (app)   app.style.setProperty('padding-top','90px','important');
-    }
+    if (isLandscape === lastLandscape) return;
+    lastLandscape = isLandscape;
+    if (isLandscape) setTimeout(tryFullscreen, 200);
   }
 
-  window.addEventListener('resize', applyOrientation);
-  window.addEventListener('orientationchange', function() {
-    setTimeout(applyOrientation, 150);
-  });
+  function scheduleOrientationCheck() {
+    setTimeout(onOrientationChange, 150);
+  }
 
   /* ─── 本地搜索历史 ─── */
   var HISTORY_KEY = 'yt_search_history';
   var MAX_HISTORY = 8;
 
   function getHistory() {
-    try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch(e) { return []; }
+    try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch (e) { return []; }
   }
   function saveHistory(q) {
     try {
-      var list = getHistory().filter(function(x) { return x !== q; });
+      var list = getHistory().filter(function (x) { return x !== q; });
       list.unshift(q);
       if (list.length > MAX_HISTORY) list = list.slice(0, MAX_HISTORY);
       localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
-    } catch(e) {}
+    } catch (e) {}
   }
   function clearHistory() {
-    try { localStorage.removeItem(HISTORY_KEY); } catch(e) {}
+    try { localStorage.removeItem(HISTORY_KEY); } catch (e) {}
   }
 
-  /* ─── 搜索建议 JSONP ─── */
+  /* ─── 搜索建议 JSONP（带序号：晚到的旧结果不会覆盖新结果） ─── */
   var suggestTimer = null;
+  var suggestSeq = 0;
+
   function fetchSuggestions(query, callback) {
+    var seq = ++suggestSeq;
     if (!query) { callback([]); return; }
-    var cbName = 'ytSugCb_' + Date.now();
-    var old = document.getElementById('yt-sug-script');
-    if (old && old.parentNode) old.parentNode.removeChild(old);
-    window[cbName] = function(data) {
-      try { delete window[cbName]; } catch(e) {}
-      var el = document.getElementById('yt-sug-script');
-      if (el && el.parentNode) el.parentNode.removeChild(el);
+    var cbName = 'ytSugCb_' + seq + '_' + Date.now();
+    var sc = document.createElement('script');
+
+    function cleanup() {
+      try { delete window[cbName]; } catch (e) { window[cbName] = undefined; }
+      if (sc.parentNode) sc.parentNode.removeChild(sc);
+    }
+
+    window[cbName] = function (data) {
+      cleanup();
+      if (seq !== suggestSeq) return;   // 用户已经继续输入或关闭了弹窗
       var list = [];
       if (data && data[1]) {
         for (var i = 0; i < Math.min(data[1].length, 6); i++) list.push(data[1][i][0]);
       }
       callback(list);
     };
-    var sc = document.createElement('script');
-    sc.id = 'yt-sug-script';
+    sc.onerror = function () {
+      cleanup();
+      if (seq === suggestSeq) callback([]);
+    };
     sc.src = 'https://suggestqueries.google.com/complete/search?client=youtube&q='
       + encodeURIComponent(query) + '&callback=' + cbName;
-    sc.onerror = function() { callback([]); };
     (document.head || document.documentElement).appendChild(sc);
   }
 
@@ -253,6 +303,8 @@ const magicScript = `
     ].join('');
 
     function closeModal() {
+      clearTimeout(suggestTimer);
+      suggestSeq++;   // 作废还没返回的建议请求
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     }
 
@@ -265,7 +317,7 @@ const magicScript = `
       try {
         window.history.pushState({}, '', path);
         window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
-      } catch(e) {
+      } catch (e) {
         window.location.href = 'https://m.youtube.com' + path;
       }
     }
@@ -288,23 +340,23 @@ const magicScript = `
       label.textContent = text;
       item.appendChild(icon);
       item.appendChild(label);
-      item.addEventListener('touchend', function(e) { e.preventDefault(); e.stopPropagation(); onTap(text); }, { passive: false });
+      item.addEventListener('touchend', function (e) { e.preventDefault(); e.stopPropagation(); onTap(text); }, { passive: false });
       return item;
     }
 
     function renderSuggestions(list) {
       listBox.innerHTML = '';
-      if (!list || !list.length) { listBox.style.setProperty('display','none','important'); return; }
-      listBox.style.setProperty('display','flex','important');
-      list.forEach(function(text) { listBox.appendChild(makeRow(searchIconSm, text, doNavigate)); });
+      if (!list || !list.length) { listBox.style.setProperty('display', 'none', 'important'); return; }
+      listBox.style.setProperty('display', 'flex', 'important');
+      list.forEach(function (text) { listBox.appendChild(makeRow(searchIconSm, text, doNavigate)); });
       if (listBox.lastChild) listBox.lastChild.style.removeProperty('border-bottom');
     }
 
     function renderHistory() {
       listBox.innerHTML = '';
       var hist = getHistory();
-      if (!hist.length) { listBox.style.setProperty('display','none','important'); return; }
-      listBox.style.setProperty('display','flex','important');
+      if (!hist.length) { listBox.style.setProperty('display', 'none', 'important'); return; }
+      listBox.style.setProperty('display', 'flex', 'important');
 
       var hdr = document.createElement('div');
       hdr.style.cssText = [
@@ -317,39 +369,39 @@ const magicScript = `
       var clearBtn = document.createElement('span');
       clearBtn.textContent = I18N.clearAll;
       clearBtn.style.cssText = 'color:#ff5555!important;font-size:12px!important;cursor:pointer!important;padding:2px 6px!important;';
-      clearBtn.addEventListener('touchend', function(e) {
+      clearBtn.addEventListener('touchend', function (e) {
         e.preventDefault(); clearHistory();
         listBox.innerHTML = '';
-        listBox.style.setProperty('display','none','important');
+        listBox.style.setProperty('display', 'none', 'important');
       }, { passive: false });
       hdr.appendChild(hdrLabel);
       hdr.appendChild(clearBtn);
       listBox.appendChild(hdr);
 
-      hist.forEach(function(text) {
-        listBox.appendChild(makeRow(clockIconSm, text, function(t) { inp.value = t; doNavigate(t); }));
+      hist.forEach(function (text) {
+        listBox.appendChild(makeRow(clockIconSm, text, function (t) { inp.value = t; doNavigate(t); }));
       });
       if (listBox.lastChild) listBox.lastChild.style.removeProperty('border-bottom');
     }
 
-    inp.addEventListener('input', function() {
+    inp.addEventListener('input', function () {
       clearTimeout(suggestTimer);
       var q = inp.value.trim();
-      if (!q) { renderHistory(); return; }
-      suggestTimer = setTimeout(function() { fetchSuggestions(q, renderSuggestions); }, 220);
+      if (!q) { suggestSeq++; renderHistory(); return; }
+      suggestTimer = setTimeout(function () { fetchSuggestions(q, renderSuggestions); }, 220);
     });
 
-    inp.addEventListener('focus', function() {
+    inp.addEventListener('focus', function () {
       if (!inp.value.trim()) renderHistory();
     });
 
-    inp.addEventListener('keydown', function(e) {
+    inp.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); doNavigate(); }
     });
 
-    cancelBtn.addEventListener('touchend', function(e) { e.preventDefault(); closeModal(); }, { passive: false });
-    confirmBtn.addEventListener('touchend', function(e) { e.preventDefault(); doNavigate(); }, { passive: false });
-    overlay.addEventListener('touchend', function(e) {
+    cancelBtn.addEventListener('touchend', function (e) { e.preventDefault(); closeModal(); }, { passive: false });
+    confirmBtn.addEventListener('touchend', function (e) { e.preventDefault(); doNavigate(); }, { passive: false });
+    overlay.addEventListener('touchend', function (e) {
       if (e.target === overlay) { e.preventDefault(); closeModal(); }
     }, { passive: false });
 
@@ -360,7 +412,7 @@ const magicScript = `
     overlay.appendChild(box);
     document.documentElement.appendChild(overlay);
 
-    setTimeout(function() { inp.focus(); renderHistory(); }, 120);
+    setTimeout(function () { inp.focus(); renderHistory(); }, 120);
   }
 
   /* ─── 首页 ─── */
@@ -379,7 +431,7 @@ const magicScript = `
     window.dispatchEvent(new PopStateEvent('popstate'));
   }
 
-  /* ─── 面板 UI ─── */
+  /* ─── 面板 UI（只负责创建，横竖屏交给 CSS） ─── */
   function ensureUI() {
     var root = document.documentElement;
 
@@ -389,28 +441,29 @@ const magicScript = `
       root.appendChild(bar);
     }
 
-    if (!document.getElementById('yt-panel')) {
-      var panel = document.createElement('div');
+    var panel = document.getElementById('yt-panel');
+    if (!panel) {
+      panel = document.createElement('div');
       panel.id = 'yt-panel';
 
       var btnSearch = document.createElement('div');
       btnSearch.className = 'yt-pb';
       btnSearch.innerHTML = SVG.search;
-      btnSearch.addEventListener('touchend', function(e) {
+      btnSearch.addEventListener('touchend', function (e) {
         e.preventDefault(); e.stopPropagation(); doSearch();
       }, { passive: false });
 
       var btnBack = document.createElement('div');
       btnBack.className = 'yt-pb';
       btnBack.innerHTML = SVG.back;
-      btnBack.addEventListener('touchend', function(e) {
+      btnBack.addEventListener('touchend', function (e) {
         e.preventDefault(); e.stopPropagation(); window.history.back();
       }, { passive: false });
 
       var btnHome = document.createElement('div');
       btnHome.className = 'yt-pb';
       btnHome.innerHTML = SVG.home;
-      btnHome.addEventListener('touchend', function(e) {
+      btnHome.addEventListener('touchend', function (e) {
         e.preventDefault(); e.stopPropagation(); goHome();
       }, { passive: false });
 
@@ -418,40 +471,34 @@ const magicScript = `
       panel.appendChild(btnBack);
       panel.appendChild(btnHome);
       root.appendChild(panel);
-    } else {
-      var p = document.getElementById('yt-panel');
-      if (p.parentNode !== root) root.appendChild(p);
+    } else if (panel.parentNode !== root) {
+      root.appendChild(panel);
     }
-
-    applyOrientation();
   }
 
-  /* ─── MutationObserver ─── */
-  var uiTimer = null;
-  var obs = new MutationObserver(function() {
-    clearTimeout(uiTimer);
-    uiTimer = setTimeout(function() { ensureStyle(); ensureUI(); }, 80);
-  });
-  function startObs() {
-    obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-  }
-  if (document.body) startObs();
-  else document.addEventListener('DOMContentLoaded', startObs);
-
-  /* ─── 强制 HD ─── */
-  function forceHD() {
+  /* ─── 强制 HD：偏好写一次 + 每次开始播放时设一次（不再每 300ms 轮询） ─── */
+  function writeQualityPref() {
     try {
       window.localStorage.setItem('yt-player-quality', JSON.stringify({
         data: 'hd1080', creation: Date.now(), expiration: Date.now() + 2592000000
       }));
-    } catch(e) {}
-    var p = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
-    if (p && p.setPlaybackQualityRange) p.setPlaybackQualityRange('hd1080', 'hd1080');
+    } catch (e) {}
+  }
+
+  function forceHD() {
+    var now = Date.now();
+    if (now - state.lastHD < 1500) return;
+    state.lastHD = now;
+    var p = getPlayer();
+    if (p && typeof p.setPlaybackQualityRange === 'function') {
+      try { p.setPlaybackQualityRange('hd1080', 'hd1080'); } catch (e) {}
+    }
   }
 
   /* ─── 跳过广告 ─── */
   var skipCooldown = false;
   var adMode = false;
+  var adSaved = null;   // 广告前用户自己的静音 / 倍速，广告后恢复
 
   function skipAd() {
     var btn = document.querySelector(
@@ -460,33 +507,54 @@ const magicScript = `
     if (btn && btn.offsetParent) {
       btn.click();
       skipCooldown = true;
-      setTimeout(function() { skipCooldown = false; }, 2000);
+      setTimeout(function () { skipCooldown = false; }, 2000);
       return true;
     }
     return false;
   }
 
-  var adInterval = setInterval(function() {
-    ensureStyle(); ensureUI(); forceHD();
+  function adTick() {
+    ensureStyle();
+    ensureUI();
     if (skipCooldown) return;
+
     var hasAd = isTubeAdPlaying();
-    var v = document.querySelector('video');
+    state.inAd = hasAd;
+    var v = getVideo();
+
     if (hasAd) {
-      adMode = true;
+      if (!adMode) {
+        adMode = true;
+        adSaved = v ? {
+          muted: v.muted,
+          rate: (v.playbackRate > 0 && v.playbackRate <= 4) ? v.playbackRate : 1
+        } : null;
+        log('ad start');
+      }
       if (skipAd()) return;
-      if (v) { v.muted = true; if (v.playbackRate < 16) v.playbackRate = 16; }
+      if (v) {
+        v.muted = true;
+        if (v.playbackRate < 16) v.playbackRate = 16;
+      }
     } else if (adMode) {
       adMode = false;
-      if (v) { v.playbackRate = 1; v.muted = false; }
+      log('ad end');
+      if (v) {
+        // 只撤销我们自己改的 16 倍速；YouTube 已经自己恢复了倍速就不动
+        if (v.playbackRate > 4) v.playbackRate = adSaved ? adSaved.rate : 1;
+        v.muted = adSaved ? adSaved.muted : false;
+      }
+      adSaved = null;
     }
-  }, 300);
-
-  ensureStyle();
-  ensureUI();
+  }
 
   /* ══════════════════════════════════════════════════════════
      锁屏播放 + 媒体会话 (移植自 YT Music 脚本 v3.4)
      ══════════════════════════════════════════════════════════ */
+
+  /* 全屏里记为“用户暂停”后，如果这么短时间内就切后台/锁屏，
+     说明其实是系统造成的暂停，撤销掉，保证后台续播 */
+  var BG_PAUSE_GRACE = 800;
 
   var state = {
     timer: null,
@@ -505,7 +573,10 @@ const magicScript = `
     allowPauseUntil: 0,
     transitionUntil: 0,
     realBackgrounded: false,
-    mediaPatched: false,
+    nativePauseAt: 0,
+    lastHD: 0,
+    lastStillCheck: 0,
+    patchedPlayers: [],
     nativePlay: null,
     nativePause: null,
     pendingUnmute: false,
@@ -543,20 +614,30 @@ const magicScript = `
     } catch (error) {}
 
     ['visibilitychange', 'webkitvisibilitychange', 'freeze'].forEach(function (type) {
-      document.addEventListener(type, swallowBackgroundEvent, true);
+      listen(document, type, swallowBackgroundEvent, true);
     });
     ['pagehide', 'blur', 'freeze'].forEach(function (type) {
-      window.addEventListener(type, swallowBackgroundEvent, true);
+      listen(window, type, swallowBackgroundEvent, true);
     });
     ['pageshow', 'focus', 'resume'].forEach(function (type) {
-      window.addEventListener(type, onForeground, true);
-      document.addEventListener(type, onForeground, true);
+      listen(window, type, onForeground, true);
+      listen(document, type, onForeground, true);
     });
   }
 
   function swallowBackgroundEvent(event) {
-    log('bg ' + (event && event.type));
+    var type = event && event.type;
+    var hardBg = isReallyHidden() || type === 'pagehide' || type === 'freeze';
+    log('bg ' + type + (hardBg ? ' (hidden)' : ''));
     state.realBackgrounded = true;
+
+    if (hardBg && state.nativePauseAt && Date.now() - state.nativePauseAt < BG_PAUSE_GRACE) {
+      log('native pause was bg, revert');
+      state.nativePauseAt = 0;
+      state.userPaused = false;
+      state.shouldResume = true;
+    }
+
     rebindMediaSession();
     setTimeout(rebindMediaSession, 450);
     setTimeout(rebindMediaSession, 1600);
@@ -574,7 +655,7 @@ const magicScript = `
   function syncResume() {
     var video = state.video || getVideo();
     if (!video || state.userPaused || state.inAd || !state.nativePlay) return;
-    if (!video.paused) return;
+    if (!video.paused || video.ended) return;
     try {
       var promise = state.nativePlay.call(video);
       if (promise && promise.catch) {
@@ -586,31 +667,21 @@ const magicScript = `
   }
 
   function patchBackgroundEventRegistration() {
-    if (window.__ytClearTubeEventPatch === VERSION) return;
-    window.__ytClearTubeEventPatch = VERSION;
-
-    var blockedTargets = {
+    var blocked = {
       visibilitychange: true,
       webkitvisibilitychange: true,
       pagehide: true,
       freeze: true,
-      resume: true
-    };
-    var softBlockedTargets = {
+      resume: true,
       blur: true
     };
-    var nativeAdd = EventTarget.prototype.addEventListener;
-
+    // 始终包装 NATIVE 原版，重复注入不会叠加
     EventTarget.prototype.addEventListener = function (type, listener, options) {
-      if (
-        type &&
-        (blockedTargets[type] || softBlockedTargets[type]) &&
-        (this === document || this === window)
-      ) {
+      if (type && blocked[type] && (this === document || this === window)) {
         log('blocked listener ' + type);
         return;
       }
-      return nativeAdd.call(this, type, listener, options);
+      return NATIVE.addEventListener.call(this, type, listener, options);
     };
   }
 
@@ -631,15 +702,15 @@ const magicScript = `
   }
 
   function patchMedia() {
-    if (state.mediaPatched || !window.HTMLMediaElement) return;
-    state.mediaPatched = true;
-    state.nativePlay = HTMLMediaElement.prototype.play;
-    state.nativePause = HTMLMediaElement.prototype.pause;
+    if (!window.HTMLMediaElement) return;
+    state.nativePlay = NATIVE.play;
+    state.nativePause = NATIVE.pause;
 
     HTMLMediaElement.prototype.play = function () {
       if (this && this.tagName === 'VIDEO') {
         state.shouldResume = true;
         state.userPaused = false;
+        state.nativePauseAt = 0;
       }
       return state.nativePlay.apply(this, arguments);
     };
@@ -687,11 +758,14 @@ const magicScript = `
   function patchPlayerMethods(player) {
     if (!player || player.__ytClearTubePlayerPatch === VERSION) return;
     player.__ytClearTubePlayerPatch = VERSION;
+    state.patchedPlayers.push(player);
 
     ['pauseVideo', 'stopVideo'].forEach(function (name) {
-      if (typeof player[name] !== 'function') return;
-      var nativeMethod = player[name];
-      player['__ytClearNative_' + name] = nativeMethod;
+      var key = '__ytClearNative_' + name;
+      // 优先取之前存下的原版，避免包装旧版本的包装函数
+      var nativeMethod = player[key] || player[name];
+      if (typeof nativeMethod !== 'function') return;
+      player[key] = nativeMethod;
       player[name] = function () {
         var now = Date.now();
         var userIntent = now < state.recentGestureUntil || now < state.allowPauseUntil;
@@ -714,25 +788,45 @@ const magicScript = `
     });
   }
 
+  function findVideo() {
+    return document.querySelector('video.html5-main-video') ||
+           document.querySelector('#movie_player video') ||
+           document.querySelector('video');
+  }
+
   function getVideo() {
     if (!state.video || !document.contains(state.video)) {
-      state.video = document.querySelector('video');
-      if (state.video && state.video.__ytClearScriptableTubeListeners !== VERSION) {
-        state.video.__ytClearScriptableTubeListeners = VERSION;
+      state.video = findVideo();
+      var v = state.video;
+      if (v && v.__ytClearBound !== VERSION) {
+        v.__ytClearBound = VERSION;
         log('video bound');
-        state.video.setAttribute('playsinline', '');
-        state.video.setAttribute('webkit-playsinline', '');
-        state.video.addEventListener('playing', onVideoPlaying, { passive: true });
-        state.video.addEventListener('play', onVideoPlaying, { passive: true });
-        state.video.addEventListener('pause', onVideoPause, true);
-        state.video.addEventListener('loadstart', markTransition, { passive: true });
-        state.video.addEventListener('emptied', markTransition, { passive: true });
-        state.video.addEventListener('canplay', onVideoCanPlay, { passive: true });
-        state.video.addEventListener('seeked', onVideoSeeked, { passive: true });
-        state.video.addEventListener('durationchange', scheduleBurst, { passive: true });
+        v.setAttribute('playsinline', '');
+        v.setAttribute('webkit-playsinline', '');
+        listen(v, 'playing', onVideoPlaying, { passive: true });
+        listen(v, 'play', onVideoPlaying, { passive: true });
+        listen(v, 'pause', onVideoPause, true);
+        listen(v, 'loadstart', markTransition, { passive: true });
+        listen(v, 'emptied', markTransition, { passive: true });
+        listen(v, 'canplay', onVideoCanPlay, { passive: true });
+        listen(v, 'seeked', onVideoSeeked, { passive: true });
+        listen(v, 'durationchange', scheduleBurst, { passive: true });
+        listen(v, 'webkitbeginfullscreen', onNativeFullscreenBegin, { passive: true });
+        listen(v, 'webkitendfullscreen', onNativeFullscreenEnd, { passive: true });
       }
     }
     return state.video;
+  }
+
+  function onNativeFullscreenBegin() {
+    log('fs begin');
+  }
+
+  function onNativeFullscreenEnd() {
+    log('fs end');
+    // 进入全屏时可能触发过 blur，把 realBackgrounded 误设为 true，这里按真实状态校正
+    state.realBackgrounded = isReallyHidden();
+    rebindMediaSession();
   }
 
   function onVideoPlaying() {
@@ -740,8 +834,10 @@ const magicScript = `
     state.transitionUntil = 0;
     state.shouldResume = true;
     state.userPaused = false;
+    state.nativePauseAt = 0;
     state.mediaSessionBound = false;
     startAudioKeepAlive();
+    forceHD();
     if (state.pendingUnmute) {
       setTimeout(function () {
         if (state.realBackgrounded) return;
@@ -754,9 +850,29 @@ const magicScript = `
     updateMediaSession();
   }
 
-  function onVideoPause() {
-    if (state.userPaused || state.inAd) return;
+  /* ─── 暂停事件（全屏无法暂停的修复在这里） ───
+     iOS 原生全屏 / 画中画用的是系统播放器，点暂停时网页收不到 touch，
+     markGesture 不会触发，旧逻辑就把它当成“后台自动暂停”立刻恢复播放。 */
+  function onVideoPause(event) {
+    var video = (event && event.target) || getVideo();
+    if (!video || state.userPaused || state.inAd) return;
+    if (video.ended) return;                        // 自然播完：交给 YouTube 切下一个
     if (Date.now() < state.transitionUntil) return;
+
+    if (inNativePlayer(video)) {
+      // 画中画小窗本身就是给后台用的，里面的暂停一定是用户点的
+      var pip = video.webkitPresentationMode === 'picture-in-picture';
+      if (pip || !isReallyHidden()) {
+        log('pause (' + (pip ? 'pip' : 'fullscreen') + ') -> user');
+        state.userPaused = true;
+        state.shouldResume = false;
+        state.nativePauseAt = pip ? 0 : Date.now();
+        updateMediaSession();
+        return;
+      }
+      log('pause (native player) while hidden -> resume');
+    }
+
     if (state.shouldResume || state.realBackgrounded) {
       syncResume();
       softResume(120);
@@ -794,6 +910,7 @@ const magicScript = `
         log('ms play');
         state.userPaused = false;
         state.shouldResume = true;
+        state.nativePauseAt = 0;
         startAudioKeepAlive();
         var video = getVideo();
         if (video && video.muted && !state.inAd) {
@@ -896,25 +1013,6 @@ const magicScript = `
     ) {
       afterMediaCommand();
     }
-  }
-
-  function seekRelative(seconds) {
-    var video = getVideo();
-    state.shouldResume = true;
-    startAudioKeepAlive();
-
-    if (callPlayerMethod(['seekBy'], [seconds])) {
-      afterMediaCommand();
-      return;
-    }
-
-    if (video && Number.isFinite(video.currentTime)) {
-      seekTo(Math.max(0, video.currentTime + seconds));
-      return;
-    }
-
-    sendShortcut(seconds > 0 ? 'L' : 'J', false);
-    afterMediaCommand();
   }
 
   function seekTo(seconds) {
@@ -1050,7 +1148,7 @@ const magicScript = `
       var video = getVideo();
       if (!video || state.userPaused || state.inAd) return;
       if (Date.now() < state.transitionUntil) return;
-      if (video.paused) attemptPlay(video);
+      if (video.paused && !video.ended) attemptPlay(video);
       updateMediaSession();
     }, delay || 0);
   }
@@ -1117,33 +1215,54 @@ const magicScript = `
     return isVisibleButton(skip);
   }
 
+  /* ─── “仍在观看？”弹窗 ───
+     2 秒查一次；用 textContent（innerText 每次都会触发重排，费电）。
+     弹窗按钮文字通常只是“是 / Yes”，所以先按弹窗文字匹配，再点里面的按钮。 */
+  var STILL_WATCHING = /still watching|continue watching|video paused|继续观看|仍在观看|還在觀看|继续播放|繼續播放/i;
+
   function dismissStillWatching() {
-    var patterns = /still watching|continue watching|video paused|继续观看|仍在观看|還在觀看|继续播放|繼續播放/i;
-    var containers = ['ytm-confirm-dialog-renderer button', 'tp-yt-paper-dialog button', 'yt-button-renderer button', 'button'];
-    for (var i = 0; i < containers.length; i++) {
-      var buttons = document.querySelectorAll(containers[i]);
-      for (var j = 0; j < buttons.length; j++) {
-        var button = buttons[j];
-        var text = (button.innerText || button.textContent || button.getAttribute('aria-label') || '').trim();
-        if (patterns.test(text) && isVisibleButton(button)) {
-          log('dismiss still-watching');
-          button.click();
+    var now = Date.now();
+    if (now - state.lastStillCheck < 2000) return;
+    state.lastStillCheck = now;
+
+    var dialogs = document.querySelectorAll(
+      'ytm-confirm-dialog-renderer, yt-confirm-dialog-renderer, tp-yt-paper-dialog, [role="dialog"], [role="alertdialog"]'
+    );
+    for (var i = 0; i < dialogs.length; i++) {
+      if (!STILL_WATCHING.test(dialogs[i].textContent || '')) continue;
+      var btns = dialogs[i].querySelectorAll('button');
+      for (var j = btns.length - 1; j >= 0; j--) {   // 确认键一般在最后
+        if (isVisibleButton(btns[j])) {
+          log('dismiss still-watching (dialog)');
+          btns[j].click();
           softResume(150);
           return;
         }
       }
     }
+
+    // 兜底：按钮自身文字匹配（原逻辑）
+    var buttons = document.querySelectorAll('button');
+    for (var k = 0; k < buttons.length; k++) {
+      var b = buttons[k];
+      var text = (b.textContent || b.getAttribute('aria-label') || '').trim();
+      if (text && STILL_WATCHING.test(text) && isVisibleButton(b)) {
+        log('dismiss still-watching (button)');
+        b.click();
+        softResume(150);
+        return;
+      }
+    }
   }
 
   function mediaTick() {
-    state.inAd = isTubeAdPlaying();
     dismissStillWatching();
     getVideo();
     updateMediaSession();
 
     if (state.shouldResume && !state.userPaused && !state.inAd) {
       var video = getVideo();
-      if (video && video.paused && Date.now() > state.transitionUntil) softResume(0);
+      if (video && video.paused && !video.ended && Date.now() > state.transitionUntil) softResume(0);
     }
   }
 
@@ -1172,6 +1291,7 @@ const magicScript = `
     mediaTick();
   }
 
+  /* ─── 调试面板：左上角 1.6 秒内连点 4 下 ─── */
   function onDebugTap(event) {
     var touch = event.changedTouches && event.changedTouches[0];
     if (!touch || touch.clientX > 90 || touch.clientY > 110) return;
@@ -1193,54 +1313,92 @@ const magicScript = `
     var panel = document.createElement('div');
     panel.id = 'ytm-debug-overlay';
     panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:55%;overflow:auto;background:rgba(0,0,0,0.92);color:#7CFC00;font:10px/1.5 monospace;z-index:2147483647;padding:10px;white-space:pre-wrap;-webkit-overflow-scrolling:touch;';
-    panel.textContent = 'v' + VERSION + '\\n' + state.logs.slice(-150).join('\\n');
+    panel.textContent = 'v' + VERSION +
+      '  fs=' + inNativePlayer(getVideo()) +
+      '  hidden=' + isReallyHidden() +
+      '  userPaused=' + state.userPaused +
+      '  inAd=' + state.inAd + '\\n' +
+      state.logs.slice(-150).join('\\n');
     document.body.appendChild(panel);
   }
 
+  /* ─── 销毁：新版本注入时彻底清理旧实例 ─── */
   function destroy() {
     if (state.timer) clearTimeout(state.timer);
     if (state.silenceTimer) clearInterval(state.silenceTimer);
     if (adInterval) clearInterval(adInterval);
-    if (obs) obs.disconnect();
+    clearTimeout(suggestTimer);
+
     if (state.keepAliveOsc) {
       try { state.keepAliveOsc.stop(); } catch (error) {}
       state.keepAliveOsc = null;
     }
-    if (state.video && state.video.__ytClearScriptableTubeListeners === VERSION) {
-      state.video.removeEventListener('playing', onVideoPlaying);
-      state.video.removeEventListener('play', onVideoPlaying);
-      state.video.removeEventListener('pause', onVideoPause, true);
-      state.video.removeEventListener('loadstart', markTransition);
-      state.video.removeEventListener('emptied', markTransition);
-      state.video.removeEventListener('canplay', onVideoCanPlay);
-      state.video.removeEventListener('seeked', onVideoSeeked);
-      state.video.removeEventListener('durationchange', scheduleBurst);
-      delete state.video.__ytClearScriptableTubeListeners;
+    if (state.audioCtx) {
+      try {
+        var closing = state.audioCtx.close();
+        if (closing && closing.catch) closing.catch(function () {});
+      } catch (error) {}
+      state.audioCtx = null;
     }
-    window.removeEventListener('popstate', onNavigate);
-    window.removeEventListener('yt-navigate-finish', onNavigate);
-    document.removeEventListener('touchstart', markGesture);
-    document.removeEventListener('touchend', markGesture);
-    document.removeEventListener('touchend', onDebugTap);
-    document.removeEventListener('click', markGesture, true);
-    document.removeEventListener('keydown', markGesture, true);
+
+    listeners.forEach(function (l) {
+      try { l[0].removeEventListener(l[1], l[2], l[3]); } catch (error) {}
+    });
+    listeners.length = 0;
+
+    HTMLMediaElement.prototype.play = NATIVE.play;
+    HTMLMediaElement.prototype.pause = NATIVE.pause;
+    EventTarget.prototype.addEventListener = NATIVE.addEventListener;
+
+    state.patchedPlayers.forEach(function (p) {
+      ['pauseVideo', 'stopVideo'].forEach(function (name) {
+        var original = p['__ytClearNative_' + name];
+        if (original) p[name] = original;
+      });
+      try { delete p.__ytClearTubePlayerPatch; } catch (error) {}
+    });
+    if (state.video) {
+      try { delete state.video.__ytClearBound; } catch (error) {}
+    }
+
+    ['hidden', 'visibilityState', 'webkitHidden', 'webkitVisibilityState', 'hasFocus'].forEach(function (k) {
+      try { delete document[k]; } catch (error) {}
+    });
+
+    ['yt-panel', 'yt-top-bar', 'yt-ios-css', 'yt-search-modal', 'ytm-debug-overlay'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    });
+
+    if (window.__ytClearScriptableTube && window.__ytClearScriptableTube.destroy === destroy) {
+      delete window.__ytClearScriptableTube;
+    }
   }
 
-  window.__ytClearScriptableTube = { version: VERSION, destroy: destroy, logs: state.logs };
+  /* ─── 启动 ─── */
+  var adInterval = null;
+
+  window.__ytClearScriptableTube = { version: VERSION, destroy: destroy, logs: state.logs, state: state };
 
   patchVisibility();
   patchBackgroundEventRegistration();
   patchMedia();
+  writeQualityPref();
+  ensureStyle();
+  ensureUI();
   updateMediaSession();
 
-  document.addEventListener('touchstart', markGesture, { passive: true });
-  document.addEventListener('touchend', markGesture, { passive: true });
-  document.addEventListener('touchend', onDebugTap, { passive: true });
-  document.addEventListener('click', markGesture, true);
-  document.addEventListener('keydown', markGesture, true);
+  listen(document, 'touchstart', markGesture, { passive: true });
+  listen(document, 'touchend', markGesture, { passive: true });
+  listen(document, 'touchend', onDebugTap, { passive: true });
+  listen(document, 'click', markGesture, true);
+  listen(document, 'keydown', markGesture, true);
+  listen(window, 'popstate', onNavigate);
+  listen(window, 'yt-navigate-finish', onNavigate);
+  listen(window, 'resize', scheduleOrientationCheck);
+  listen(window, 'orientationchange', scheduleOrientationCheck);
 
-  window.addEventListener('popstate', onNavigate);
-  window.addEventListener('yt-navigate-finish', onNavigate);
+  adInterval = setInterval(adTick, 300);
 
   getVideo();
   getPlayer();
@@ -1253,6 +1411,23 @@ null;
 `;
 
 await webView.evaluateJavaScript(magicScript);
+
+// YouTube 偶尔会整页刷新（例如搜索的兜底跳转），注入的代码会随之丢失。
+// 每 3 秒检查一次，没有就补注入；已经存在时只是一次很小的查询。
+const aliveCheck = "!!(window.__ytClearScriptableTube && window.__ytClearScriptableTube.version === '" + VERSION + "')";
+let reinjecting = false;
+const reinjectTimer = Timer.schedule(3000, true, async () => {
+  if (reinjecting) return;
+  reinjecting = true;
+  try {
+    const alive = await webView.evaluateJavaScript(aliveCheck);
+    if (!alive) await webView.evaluateJavaScript(magicScript);
+  } catch (e) {}
+  reinjecting = false;
+});
+
 await webView.present(true);
+reinjectTimer.invalidate();
+Script.complete();
 
 }

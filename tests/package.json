@@ -1,0 +1,11 @@
+{
+  "name": "scriptable-youtube-clear-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node pause-scenarios.mjs && node destroy.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
