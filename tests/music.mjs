@@ -197,6 +197,12 @@ const SCENARIOS = [
       const iv = setInterval(() => w.document.body.appendChild(w.document.createElement('span')), 16);
       await sleep(2000); clearInterval(iv);
       const n = w.__qsa - q0; return n < 600 ? '正常' : ('过高 ' + n + ' 次'); } },
+  { name: '三根手指点屏幕打开调试面板', expect: '已打开', run: async (w, v) => {
+      await sleep(300);
+      const ev = new w.Event('touchstart', { bubbles: true });
+      Object.defineProperty(ev, 'touches', { value: [{}, {}, {}] });
+      w.document.body.dispatchEvent(ev); await sleep(200);
+      return w.document.getElementById('ytm-debug-overlay') ? '已打开' : '未打开'; } },
   { name: 'destroy() 还原所有补丁', expect: '已还原', run: async (w, v) => {
       await sleep(200); w.__ytClearScriptableMusic.destroy();
       return (w.HTMLMediaElement.prototype.play === w.__origPlay && w.EventTarget.prototype.addEventListener === w.__origAdd &&

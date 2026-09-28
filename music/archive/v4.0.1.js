@@ -2,10 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.2-scriptable';
-
-// 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
-const SHOW_LOG_ON_CLOSE = true;
+const VERSION = '4.0.1-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -139,7 +136,6 @@ const magicScript = `
     lastDialogCheck: 0,
 
     debugTaps: [],
-    logSeq: 0,
     logs: []
   };
 
@@ -147,7 +143,6 @@ const magicScript = `
     try {
       var t = new Date();
       state.logs.push(t.toTimeString().slice(0, 8) + '.' + ('00' + t.getMilliseconds()).slice(-3) + ' ' + message);
-      state.logSeq++;
       if (state.logs.length > 800) state.logs.splice(0, 200);
     } catch (e) {}
   }
@@ -369,17 +364,9 @@ const magicScript = `
     var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
     log('resume after interruption (' + reason + ')');
     state.protectPlayUntil = Date.now() + RESUME_PROTECT;
-    // 对方已经交还声音：先把保活音频接回来（重新激活音频会话），后台才允许开始播放
-    applyKeepAlivePolicy('resume');
     try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
     softResume(400);
     softResume(1200);
-    softResume(2500);
-    setTimeout(function () {
-      var v = state.video;
-      log('after resume: video ' + (v && !v.paused ? 'playing' : 'still paused') +
-        ' [audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ' session=' + (audioSessionState() || '-') + ']');
-    }, 3000);
   }
 
   function endInterruption(reason) {
@@ -1702,8 +1689,8 @@ const magicScript = `
   }
 
   /* ══════════════════════════════════════════════════════════
-     调试面板：三根手指同时点屏幕，或屏幕左上角 1.6 秒内连点 4 下
-     关闭脚本后，Scriptable 还会弹窗提供“复制日志”
+     调试面板：屏幕左上角 1.6 秒内连点 4 下
+     （在 window 捕获阶段监听，YT Music 顶栏吞不掉）
      ══════════════════════════════════════════════════════════ */
 
   function onDebugTap(event) {
@@ -1716,16 +1703,6 @@ const magicScript = `
       state.debugTaps = [];
       toggleDebugOverlay();
     }
-  }
-
-  // 三根手指同时点屏幕：打开 / 关闭调试面板（不会和 YT Music 的操作冲突）
-  var lastThreeFinger = 0;
-  function onThreeFingerTap(event) {
-    if (!event.touches || event.touches.length !== 3) return;
-    var now = Date.now();
-    if (now - lastThreeFinger < 800) return;
-    lastThreeFinger = now;
-    toggleDebugOverlay();
   }
 
   function toggleDebugOverlay() {
@@ -1852,7 +1829,6 @@ const magicScript = `
   listen(document, 'touchstart', markGesture, { passive: true });
   listen(document, 'touchend', markGesture, { passive: true });
   listen(window, 'touchend', onDebugTap, { capture: true, passive: true });
-  listen(window, 'touchstart', onThreeFingerTap, { capture: true, passive: true });
   listen(document, 'click', markGesture, true);
   listen(document, 'keydown', markGesture, true);
 
@@ -1878,76 +1854,32 @@ await webView.evaluateJavaScript(magicScript);
 // 页面整页刷新（例如“打开 App”链接改成网页打开）后，注入的代码会丢失。
 // 每 3 秒检查一次，没有就补注入；已经存在时只是一次很小的查询。
 const aliveCheck = "!!(window.__ytClearScriptableMusic && window.__ytClearScriptableMusic.version === '" + VERSION + "')";
-
-// 日志镜像：每 3 秒把网页里新增的日志取回 Scriptable 这边保存，
-// 这样即使关闭后网页已经取不到，也能拿到日志
-const mirror = [];
-let lastSeq = 0;
-async function pullLogs() {
-  const js = "(function(){var t=window.__ytClearScriptableMusic;if(!t||!t.state)return null;" +
-    "var s=t.state.logSeq,n=s>=" + lastSeq + "?Math.min(t.logs.length,s-" + lastSeq + "):t.logs.length;" +
-    "return JSON.stringify({seq:s,lines:n>0?t.logs.slice(-n):[]});})()";
-  const raw = await webView.evaluateJavaScript(js);
-  if (!raw) return;
-  const r = JSON.parse(raw);
-  if (r.seq < lastSeq) mirror.push('--- 页面重新加载 ---');
-  for (const line of r.lines) mirror.push(line);
-  if (mirror.length > 1500) mirror.splice(0, mirror.length - 1500);
-  lastSeq = r.seq;
-}
-
-let busy = false;
+let reinjecting = false;
 const reinjectTimer = Timer.schedule(3000, true, async () => {
-  if (busy) return;
-  busy = true;
+  if (reinjecting) return;
+  reinjecting = true;
   try {
     const alive = await webView.evaluateJavaScript(aliveCheck);
     if (!alive) await webView.evaluateJavaScript(magicScript);
-    await pullLogs();
   } catch (e) {}
-  busy = false;
+  reinjecting = false;
 });
 
 await webView.present(true);
 reinjectTimer.invalidate();
 
-// 关闭后：取回最后的日志，存文件，并弹窗让你一键复制
-try { await pullLogs(); } catch (e) {}
-if (mirror.length) {
-  let status = '';
-  try {
-    status = await webView.evaluateJavaScript(
-      "(function(){var t=window.__ytClearScriptableMusic;if(!t)return '';var s=t.state,v=s.video;" +
-      "return 'userPaused='+s.userPaused+' interrupted='+s.interrupted+' keepAlive='+!!s.keepAliveOsc+" +
-      "' audio='+(s.audioCtx?s.audioCtx.state:'-')+' session='+(navigator.audioSession?navigator.audioSession.state:'n/a')+" +
-      "' video='+(v&&!v.paused?'playing':'paused');})()"
-    );
-  } catch (e) {}
-  const text = 'v' + VERSION + '  ' + new Date().toString() + '\n' + (status || '') + '\n' + mirror.join('\n');
-
-  // 存文件：先试 iCloud，失败再存本机（文件 App → Scriptable → yt-music-clear-log.txt）
-  let savedTo = '';
-  const targets = [['iCloud 云盘', () => FileManager.iCloud()], ['我的 iPhone', () => FileManager.local()]];
-  for (const [label, make] of targets) {
-    try {
-      const fm = make();
-      fm.writeString(fm.joinPath(fm.documentsDirectory(), 'yt-music-clear-log.txt'), text);
-      savedTo = label;
-      break;
-    } catch (e) {}
+// 关闭后把本次日志存到 Scriptable 文件夹（文件 App → iCloud 云盘 / 我的 iPhone → Scriptable → yt-music-clear-log.txt）
+try {
+  const logText = await webView.evaluateJavaScript(
+    "(function(){var t=window.__ytClearScriptableMusic;return t&&t.logs?t.logs.join('\\n'):'';})()"
+  );
+  if (logText) {
+    let fm;
+    try { fm = FileManager.iCloud(); } catch (e) { fm = FileManager.local(); }
+    fm.writeString(fm.joinPath(fm.documentsDirectory(), 'yt-music-clear-log.txt'),
+      'v' + VERSION + '  ' + new Date().toString() + '\n' + logText);
   }
-
-  if (SHOW_LOG_ON_CLOSE) {
-    const a = new Alert();
-    a.title = '本次运行日志（' + mirror.length + ' 行）';
-    a.message = (status ? status + '\n\n' : '') + '最后几行：\n' + mirror.slice(-6).join('\n') +
-      (savedTo ? '\n\n已保存到 文件 App → ' + savedTo + ' → Scriptable → yt-music-clear-log.txt' : '');
-    a.addAction('复制日志');
-    a.addCancelAction('不用');
-    const choice = await a.presentAlert();
-    if (choice === 0) Pasteboard.copy(text);
-  }
-}
+} catch (e) {}
 Script.complete();
 
 }
