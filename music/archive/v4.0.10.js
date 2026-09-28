@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.11-scriptable';
+const VERSION = '4.0.10-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -1217,8 +1217,6 @@ const magicScript = `
       }
     }
     if (!state.playingSince) state.playingSince = Date.now();
-    var pv = event && event.target;
-    if (pv && pv.__ytClearDiagDone !== VERSION) { pv.__ytClearDiagDone = VERSION; setTimeout(function () { mediaDiag('first playing'); }, 1500); }
     state.transitionUntil = 0;
     clearUserPaused();
     state.mediaSessionBound = false;
@@ -1407,9 +1405,6 @@ const magicScript = `
     state.mediaSessionBound = true;
     state.lastMediaSessionRefresh = Date.now();
 
-    // 锁屏 / 控制中心的播放、暂停：交给 YT Music 自己的播放器处理，它的状态和登记给系统的“正在播放”才会同步。
-    // 真机：脚本直接暂停 <video> 后，第一次暂停时控制中心的“正在播放”会丢（变成系统“音乐”App），
-    // 在 App 里用 YT Music 自己的按钮播放 / 暂停过一次后才正常。播放器没反应时再直接操作 <video>。
     setMediaAction('play', function () {
       log('ms play');
       state.yieldedInBg = false;
@@ -1419,28 +1414,16 @@ const magicScript = `
       state.resumeAfterInterruption = false;
       clearUserPaused();
       startAudioKeepAlive();
-      var viaPlayer = ytPlayerCall('playVideo');
-      if (!viaPlayer) blessGesture();
-      setTimeout(function () {
-        var v = getVideo();
-        if (v && v.paused) { log('ms play: fallback to element play'); blessGesture(); }
-      }, viaPlayer ? 300 : 0);
-      softResume(500);
+      blessGesture();
+      softResume(150);
     });
     setMediaAction('pause', function () {
       log('ms pause');
-      mediaDiag('ms pause');
+      var video = getVideo();
       state.allowPauseUntil = Date.now() + 1500;
       setUserPaused('lock screen');
-      var viaPlayer = ytPlayerCall('pauseVideo');
-      setTimeout(function () {
-        var v = getVideo();
-        if (v && !v.paused) {
-          if (viaPlayer) log('ms pause: fallback to element pause');
-          try { NATIVE.pause.call(v); } catch (e) {}
-        }
-        updateMediaSession();
-      }, viaPlayer ? 300 : 0);
+      if (video) { try { NATIVE.pause.call(video); } catch (e) {} }
+      updateMediaSession();
     });
     setMediaAction('previoustrack', previousTrack);
     setMediaAction('nexttrack', nextTrack);
@@ -1452,58 +1435,6 @@ const magicScript = `
       log('ms seekto');
       seekTo(details.seekTime);
     });
-  }
-
-  // 调用 YT Music 播放器自己的方法（原版，不经过脚本的包装）
-  function ytPlayerCall(name) {
-    var p = getPlayer();
-    var fn = p && (p['__ytClearNative_' + name] || p[name]);
-    if (typeof fn !== 'function') return false;
-    try { fn.call(p); return true; } catch (e) { return false; }
-  }
-
-  // 排查“控制中心暂停后正在播放丢失”：记录可能相关的状态
-  function mediaDiag(tag) {
-    var v = state.video;
-    var ms = navigator.mediaSession;
-    var md = ms && ms.metadata;
-    var r = null, cs = null;
-    try { r = v && v.getBoundingClientRect(); } catch (e) {}
-    try { cs = v && window.getComputedStyle(v); } catch (e) {}
-    log(tag + ' diag: muted=' + (v && v.muted) + ' vol=' + (v && v.volume) +
-      ' size=' + (r ? Math.round(r.width) + 'x' + Math.round(r.height) : '-') +
-      ' display=' + (cs ? cs.display : '-') + ' vis=' + (cs ? cs.visibility : '-') +
-      ' meta=' + (md ? JSON.stringify(String(md.title || '').slice(0, 30)) : 'none') +
-      ' msState=' + (ms ? ms.playbackState : '-') + ' ready=' + (v && v.readyState) +
-      ' path=' + location.pathname + ' playerApi=' + (typeof (getPlayer() || {}).pauseVideo));
-  }
-
-  // YT Music 还没把歌名 / 封面登记给系统时，从播放栏读取后补上（没有歌名时系统可能不把网页当作“正在播放”）
-  var lastMetaCheck = 0;
-  function ensureMetadata() {
-    var now = Date.now();
-    if (now - lastMetaCheck < 3000) return;
-    lastMetaCheck = now;
-    var ms = navigator.mediaSession;
-    if (!ms || typeof window.MediaMetadata !== 'function') return;
-    var v = state.video;
-    if (!v || v.paused || state.inAd) return;
-    if (ms.metadata && ms.metadata.title) return;
-    var bar = document.querySelector('ytmusic-player-bar');
-    var titleEl = bar && bar.querySelector('.title');
-    var title = titleEl && (titleEl.textContent || '').trim();
-    if (!title) return;
-    var byline = bar.querySelector('.byline');
-    var artist = byline ? (byline.textContent || '').split('\u2022')[0].trim() : '';
-    var img = bar.querySelector('img');
-    try {
-      ms.metadata = new MediaMetadata({
-        title: title,
-        artist: artist,
-        artwork: img && img.src ? [{ src: img.src, sizes: '544x544' }] : []
-      });
-      log('metadata filled from player bar: ' + title.slice(0, 40));
-    } catch (e) {}
   }
 
   function rebindMediaSession() {
@@ -1932,7 +1863,6 @@ const magicScript = `
     updateMediaSession();
     applyKeepAlivePolicy('tick');
     watchProgress();
-    ensureMetadata();
 
     if (state.shouldResume && canAutoResume()) {
       var video = getVideo();

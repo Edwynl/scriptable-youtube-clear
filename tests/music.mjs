@@ -288,6 +288,21 @@ const SCENARIOS = [
       A.touch(w); A.pagePause(w, v); await sleep(1500);
       touch(w, w.document.body, 200, 300); await sleep(1500);
       return v.paused ? '仍暂停' : '响了'; } },
+  { name: '控制中心暂停 / 播放交给 YT Music 自己的播放器', expect: 'pause,play，播放', run: async (w, v) => {
+      const p = w.document.getElementById('movie_player'); const calls = [];
+      p.pauseVideo = function () { calls.push('pause'); w.HTMLMediaElement.prototype.pause.call(v); };
+      p.playVideo = function () { calls.push('play'); w.HTMLMediaElement.prototype.play.call(v); };
+      await sleep(300); w.__handlers.pause(); await sleep(600); const mid = st(v);
+      w.__handlers.play(); await sleep(800);
+      return calls.join(',') + '，' + (mid === '暂停' ? st(v) : '没暂停'); } },
+  { name: 'YT Music 没登记歌名时，从播放栏补上', expect: '已补歌名', run: async (w, v) => {
+      w.MediaMetadata = function (o) { Object.assign(this, o); };
+      const bar = w.document.querySelector('ytmusic-player-bar');
+      const t = w.document.createElement('div'); t.className = 'title'; t.textContent = '测试歌曲'; bar.appendChild(t);
+      const b = w.document.createElement('div'); b.className = 'byline'; b.textContent = '歌手 \u2022 专辑'; bar.appendChild(b);
+      await sleep(3500);
+      const md = w.navigator.mediaSession.metadata;
+      return md && md.title === '测试歌曲' && md.artist === '歌手' ? '已补歌名' : '未补'; } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
