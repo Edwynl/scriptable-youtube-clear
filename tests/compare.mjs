@@ -42,7 +42,9 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test', before
     Object.defineProperty(P, 'currentTime',  { get(){ return this.__t || 0; }, set(v){ this.__t = v; }, configurable: true });
     Object.defineProperty(P, 'muted',        { get(){ return !!this.__m; }, set(v){ this.__m = !!v; }, configurable: true });
     Object.defineProperty(P, 'playbackRate', { get(){ return this.__r || 1; }, set(v){ this.__r = v; }, configurable: true });
+    window.__plays = 0;
     P.play = function () {
+      window.__plays++;
       var was = this.paused; this.__p = false;
       if (was) { this.dispatchEvent(new Event('play')); this.dispatchEvent(new Event('playing')); }
       return Promise.resolve();
@@ -65,6 +67,19 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test', before
       this.webkitPresentationMode = mode;
       this.webkitDisplayingFullscreen = mode !== 'inline';
       this.dispatchEvent(new Event('webkitpresentationmodechanged'));
+    };
+    // 模拟 iOS 的 AudioContext：被别的 App 打断时 state 变成 'interrupted'
+    window.__ctxs = [];
+    window.AudioContext = function () {
+      var et = new EventTarget();
+      et.state = 'suspended'; et.destination = {}; et.__resumeCalls = 0;
+      et.resume = function () { et.__resumeCalls++; if (et.state !== 'interrupted') et.state = 'running'; return Promise.resolve(); };
+      et.suspend = function () { et.state = 'suspended'; return Promise.resolve(); };
+      et.close = function () { return Promise.resolve(); };
+      et.createGain = function () { return { gain: { value: 1 }, connect(){}, disconnect(){} }; };
+      et.createOscillator = function () { return { frequency: { value: 0 }, connect(){}, disconnect(){}, start(){}, stop(){} }; };
+      window.__ctxs.push(et);
+      return et;
     };
     navigator.mediaSession = {
       setActionHandler(n, f){ window.__handlers[n] = f; },
@@ -99,6 +114,15 @@ const A = {
   landscape: w => { w.__vw = 932; w.__vh = 430; w.dispatchEvent(new w.Event('resize')); },
 };
 const state = v => (v.paused ? '暂停' : '播放');
+const ctxOf = w => w.__ctxs[w.__ctxs.length - 1];
+const setAudio = (w, st) => { const c = ctxOf(w); if (!c) return; c.state = st; c.dispatchEvent(new w.Event('statechange')); };
+// 其他 App 抢走声音：系统暂停视频 + AudioContext 进入 interrupted；过程中统计我们去抢音频的次数
+async function interruptFor(w, v, ms) {
+  A.sysPause(w, v); await sleep(100); setAudio(w, 'interrupted');
+  const c = ctxOf(w); const before = c ? c.__resumeCalls : 0;
+  const playsBefore = w.__plays; await sleep(ms);
+  return { grabbed: (c ? c.__resumeCalls - before : 0) + (w.__plays - playsBefore), paused: v.paused };
+}
 
 /* ─── 场景 ─── */
 const SCENARIOS = [
@@ -200,6 +224,29 @@ const SCENARIOS = [
   { group: '画中画', name: '去掉 YouTube 加的 disablepictureinpicture', expect: '已移除', run: async (w, v) => {
       v.setAttribute('disablepictureinpicture', ''); await sleep(1000);
       return v.hasAttribute('disablepictureinpicture') ? '仍存在' : '已移除'; } },
+  { group: '被打断', name: '后台播放时听微信语音：期间不抢声音', expect: '暂停，抢 0 次', run: async (w, v) => {
+      A.lock(w); await sleep(2000);
+      const r = await interruptFor(w, v, 3000);
+      return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次'; } },
+  { group: '被打断', name: '微信语音结束后自动继续播放', expect: '播放', run: async (w, v) => {
+      A.lock(w); await sleep(2000); await interruptFor(w, v, 1500);
+      setAudio(w, 'running'); await sleep(2000); return state(v); } },
+  { group: '被打断', name: '画中画时听微信语音：期间不抢，结束后继续', expect: '暂停→播放', run: async (w, v) => {
+      A.toPiP(w, v, false); A.lock(w); await sleep(2500);
+      const r = await interruptFor(w, v, 2000);
+      setAudio(w, 'running'); await sleep(2000);
+      return (r.paused && r.grabbed === 0 ? '暂停' : '抢了') + '→' + state(v); } },
+  { group: '被打断', name: '前台看视频时来电：通话中暂停，挂断后继续', expect: '暂停→播放', run: async (w, v) => {
+      const r = await interruptFor(w, v, 2000);
+      setAudio(w, 'running'); await sleep(2000);
+      return (r.paused ? '暂停' : '播放') + '→' + state(v); } },
+  { group: '被打断', name: '后台来电，挂断后回到 App（没收到结束信号）', expect: '暂停→播放', run: async (w, v) => {
+      A.lock(w); await sleep(2000);
+      const r = await interruptFor(w, v, 2000);
+      w.__fakeHidden = false; w.document.dispatchEvent(new w.Event('visibilitychange')); await sleep(2000);
+      return (r.paused ? '暂停' : '播放') + '→' + state(v); } },
+  { group: '被打断', name: '后台拔耳机（没有打断信号）：保持暂停', expect: '暂停', run: async (w, v) => {
+      A.lock(w); await sleep(2000); A.sysPause(w, v); await sleep(2500); return state(v); } },
   { group: '其他', name: '首页横屏不全屏（预览视频）', url: 'https://m.youtube.com/', expect: '0 次', run: async (w, v) => {
       await sleep(200); A.landscape(w); await sleep(1200); return w.__fsCalls + ' 次'; } },
   { group: '其他', name: 'destroy() 还原所有补丁', expect: '已还原', run: async (w, v) => {

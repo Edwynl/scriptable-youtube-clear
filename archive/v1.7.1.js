@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.8.0-scriptable';
+const VERSION = '1.7.1-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -83,7 +83,6 @@ const magicScript = `
 
   var BG_PAUSE_GRACE = 1000;               // 前台暂停后这么短时间内进入后台 → 其实是切后台造成的
   var PIP_SETTLE = 2000;                   // 进入画中画后这么短时间内的暂停 → 过渡中系统造成的
-  var BG_SETTLED = 1500;                   // 进入后台超过这么久后出现的暂停 → 被别的 App 打断（微信语音、来电）
   var FS_QUIET_AFTER = 2000;               // blur / 离开画中画后这么久内不自动全屏
   var KEEPALIVE_IDLE_STOP = 10 * 60 * 1000; // 用户暂停超过 10 分钟 → 停掉保活音频省电
   var AD_SKIP_SEL = '.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,.ytp-ad-skip-button-container button';
@@ -133,13 +132,7 @@ const magicScript = `
 
     pipSince: 0,               // 进入画中画的时间
     lastPipEndAt: 0,           // 离开画中画的时间
-    lastBlurAt: 0,
-
-    hiddenSince: 0,            // 页面真正进入后台的时间
-    interrupted: false,        // 音频被别的 App 打断中（微信语音、来电、Siri……）
-    interruptedAt: 0,
-    resumeAfterInterruption: false,
-    userPausedReason: '',             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
+    lastBlurAt: 0,             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
 
     debugTaps: [],
     logs: []
@@ -614,7 +607,6 @@ const magicScript = `
     state.userPaused = true;
     state.shouldResume = false;
     state.userPausedAt = Date.now();
-    state.userPausedReason = reason;
     state.fgPauseAt = 0;
   }
 
@@ -636,48 +628,6 @@ const magicScript = `
 
   function isBackground() {
     return state.realBackgrounded || isReallyHidden();
-  }
-
-  /* ─── 被别的 App 打断音频（微信语音、来电、Siri、闹钟）───
-     打断期间：不恢复播放、保活音频也不去抢音频会话，把声音让给对方；
-     打断结束（AudioContext 离开 interrupted 状态）或回到 App 时，再自动继续。 */
-  function beginInterruption(reason) {
-    var now = Date.now();
-    if (!state.interrupted) {
-      state.interrupted = true;
-      state.interruptedAt = now;
-      // 打断前在播放：结束后要继续
-      state.resumeAfterInterruption = state.shouldResume && !state.userPaused;
-      // 刚才那次暂停被当成了“用户暂停”（画中画 / 全屏 / 前台系统暂停），其实是打断造成的
-      if (state.userPaused && now - state.userPausedAt < 1500 &&
-          ['picture-in-picture', 'native fullscreen', 'system (foreground)'].indexOf(state.userPausedReason) >= 0) {
-        state.userPaused = false;
-        state.resumeAfterInterruption = true;
-      }
-      log('interrupted: ' + reason + (state.resumeAfterInterruption ? ' (will resume)' : ''));
-    }
-    state.shouldResume = false;
-  }
-
-  function endInterruption(reason) {
-    if (!state.interrupted) return;
-    state.interrupted = false;
-    log('interruption ended: ' + reason);
-    if (state.resumeAfterInterruption && !state.userPaused) {
-      state.resumeAfterInterruption = false;
-      clearUserPaused();
-      softResume(600);
-      softResume(1500);
-    }
-    state.resumeAfterInterruption = false;
-  }
-
-  function onAudioStateChange() {
-    var ctx = state.audioCtx;
-    if (!ctx) return;
-    log('audio ' + ctx.state);
-    if (ctx.state === 'interrupted') beginInterruption('audio session');
-    else if (state.interrupted) endInterruption('audio ' + ctx.state);
   }
 
   function isWindowLevelEvent(event) {
@@ -739,7 +689,6 @@ const magicScript = `
       ' mode=' + ((bgVideo && bgVideo.webkitPresentationMode) || 'inline') +
       (bgVideo && !bgVideo.paused ? ' playing' : ' paused'));
     state.realBackgrounded = true;
-    if (hardBg && !state.hiddenSince) state.hiddenSince = Date.now();
 
     // 刚被当作暂停的前台暂停，其实是切后台造成的 → 撤销
     // （原生播放器里的暂停只认真正的 hidden，因为进入全屏本身也会 blur）
@@ -751,7 +700,7 @@ const magicScript = `
     rebindMediaSession();
     setTimeout(rebindMediaSession, 450);
     setTimeout(rebindMediaSession, 1600);
-    if (state.shouldResume && !state.userPaused && !state.interrupted) {
+    if (state.shouldResume && !state.userPaused) {
       syncResume();
       softResume(120);
       softResume(700);
@@ -763,8 +712,6 @@ const magicScript = `
     if (!isWindowLevelEvent(event)) return;
     log('fg' + (event && event.type ? ' ' + event.type : ''));
     state.realBackgrounded = false;
-    state.hiddenSince = 0;
-    endInterruption('back to app');
     if (!state.userPaused) startAudioKeepAlive();
     rebindMediaSession();
     if (state.pendingUnmute) {
@@ -810,7 +757,7 @@ const magicScript = `
       return true;
     }
     if (now < state.transitionUntil) return true;
-    if (state.interrupted || state.userPaused || !state.shouldResume) return true;
+    if (state.userPaused || !state.shouldResume) return true;
     // 原生全屏 / 画中画里，用户的暂停来自系统控件，不经过网页 JS；
     // 这时网页调 pause() 只可能是 YouTube 自己（比如检测到画中画就暂停）
     if (inNativePlayer(el || state.video || findVideo())) {
@@ -1028,7 +975,6 @@ const magicScript = `
 
   function onVideoPlaying() {
     log('playing');
-    if (state.interrupted) { state.interrupted = false; state.resumeAfterInterruption = false; log('interruption ended: playing'); }
     state.transitionUntil = 0;
     clearUserPaused();
     state.mediaSessionBound = false;
@@ -1064,8 +1010,7 @@ const magicScript = `
           if (state.shouldResume) { syncResume(); softResume(150); softResume(700); }
           return;
         }
-        if (state.interrupted) { updateMediaSession(); return; }
-        // 之后画中画里的暂停，是用户点了小窗上的按钮（如果随后发现是音频被打断，会再改回来）
+        // 之后画中画里的暂停，是用户点了小窗上的按钮
         setUserPaused('picture-in-picture');
         updateMediaSession();
         return;
@@ -1082,15 +1027,7 @@ const magicScript = `
       return;
     }
 
-    // 3) 已在后台一段时间后才出现的暂停：不是切后台造成的，而是被别的 App 打断
-    //    （微信语音、来电、Siri）→ 让出声音，不去抢
-    if (state.interrupted || (state.hiddenSince && Date.now() - state.hiddenSince > BG_SETTLED)) {
-      beginInterruption('pause in background');
-      updateMediaSession();
-      return;
-    }
-
-    // 4) 刚切到后台时系统造成的暂停 → 恢复
+    // 3) 已在后台：系统造成的暂停 → 恢复
     log('pause while backgrounded -> resume');
     if (state.shouldResume) {
       syncResume();
@@ -1120,7 +1057,7 @@ const magicScript = `
 
   function syncResume() {
     var video = state.video || getVideo();
-    if (!video || state.userPaused || state.inAd || state.interrupted) return;
+    if (!video || state.userPaused || state.inAd) return;
     if (!video.paused || video.ended) return;
     try {
       var promise = NATIVE.play.call(video);
@@ -1164,7 +1101,7 @@ const magicScript = `
   function softResume(delay) {
     setTimeout(function () {
       var video = getVideo();
-      if (!video || state.userPaused || state.inAd || state.interrupted) return;
+      if (!video || state.userPaused || state.inAd) return;
       if (Date.now() < state.transitionUntil) return;
       if (video.paused && !video.ended) attemptPlay(video);
       updateMediaSession();
@@ -1196,8 +1133,6 @@ const magicScript = `
 
     setMediaAction('play', function () {
       log('ms play');
-      state.interrupted = false;
-      state.resumeAfterInterruption = false;
       clearUserPaused();
       startAudioKeepAlive();
       var video = getVideo();
@@ -1383,9 +1318,7 @@ const magicScript = `
 
     if (!state.audioCtx) {
       try { state.audioCtx = new AC(); } catch (e) { return; }
-      try { listen(state.audioCtx, 'statechange', onAudioStateChange); } catch (e) {}
     }
-    if (state.interrupted) return;   // 被打断时不抢音频会话
     if (state.audioCtx.state !== 'running') {
       try {
         var p = state.audioCtx.resume();
@@ -1407,7 +1340,6 @@ const magicScript = `
     }
     if (!state.silenceTimer) {
       state.silenceTimer = setInterval(function () {
-        if (state.interrupted) return;
         if (state.audioCtx && state.audioCtx.state !== 'running') {
           try {
             var p2 = state.audioCtx.resume();
@@ -1588,7 +1520,7 @@ const magicScript = `
     allowPictureInPicture(state.video);
     ensureLandscapeFullscreen('tick');
 
-    if (state.shouldResume && !state.userPaused && !state.inAd && !state.interrupted) {
+    if (state.shouldResume && !state.userPaused && !state.inAd) {
       var video = getVideo();
       if (video && video.paused && !video.ended && Date.now() > state.transitionUntil) softResume(0);
     }
@@ -1651,9 +1583,7 @@ const magicScript = `
       '  bg=' + state.realBackgrounded +
       '  userPaused=' + state.userPaused +
       '  inAd=' + state.inAd +
-      '  keepAlive=' + !!state.keepAliveOsc +
-      '  interrupted=' + state.interrupted +
-      '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') + '\\n' +
+      '  keepAlive=' + !!state.keepAliveOsc + '\\n' +
       state.logs.slice(-150).join('\\n');
     document.body.appendChild(panel);
   }
