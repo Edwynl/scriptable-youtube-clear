@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.5-scriptable';
+const VERSION = '4.0.4-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -134,8 +134,6 @@ const magicScript = `
     recoverStartedAt: 0,
     recoverTimer: null,
     lastLinkTapAt: 0,
-    expectNudgePause: false,   // 下一次暂停是我们自己“暂停再播放”重启播放器造成的
-    savedSessionType: null,    // 恢复期间临时改过 navigator.audioSession.type
 
     mediaSessionBound: false,
     lastMediaSessionRefresh: 0,
@@ -393,11 +391,10 @@ const magicScript = `
       if (t > state.recoverUntil) { stopAudioRecovery('gave up after ' + attempts + ' tries'); return; }
       if (ctx && ctx.state === 'running' && attempts > 0) {
         log('audio restored after ' + ((t - state.recoverStartedAt) / 1000).toFixed(1) + 's (' + attempts + ' tries, video ' + (v && !v.paused ? 'playing' : 'paused') + ')');
+        if (v && v.paused && !v.ended) attemptPlay(v);
         stopAudioRecovery('');
-        restartPlayer('audio restored');
         return;
       }
-      if (attempts === 0) setSessionType('playback');
       attempts++;
       startAudioKeepAlive();
       if (ctx && ctx.state !== 'running') {
@@ -409,57 +406,10 @@ const magicScript = `
     setTimeout(step, 150);
   }
 
-  /* 真机：系统先把音乐恢复成“播放中”，那时音频会话还没激活，底层播放器启动失败 → 无声；
-     会话随后激活了，但没有东西让播放器重新启动。所以声音接回来后，暂停再马上播放一次，
-     并记录播放进度有没有在走（区分“无声但在走”和“卡住不动”）。 */
-  function restartPlayer(reason) {
-    var v = state.video;
-    if (!v || v.ended) return;
-    var t0 = v.currentTime;
-    log('restart player (' + reason + ') at ' + t0.toFixed(1) + 's');
-    // 只忽略我们自己造成的这一次暂停（不能按时间窗口忽略，否则会吞掉紧接着的下一条微信语音）
-    if (!v.paused) {
-      state.expectNudgePause = true;
-      setTimeout(function () { state.expectNudgePause = false; }, 600);
-      try { NATIVE.pause.call(v); } catch (e) { state.expectNudgePause = false; }
-    }
-    setTimeout(function () {
-      try {
-        var p = NATIVE.play.call(v);
-        if (p && p.catch) p.catch(function (err) { log('restart play blocked ' + (err && err.name)); });
-      } catch (e) {}
-    }, 200);
-    setTimeout(function () {
-      var dt = v.currentTime - t0;
-      log('progress after restart: +' + dt.toFixed(1) + 's (' + (v.paused ? 'paused' : 'playing') +
-        ', audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ')');
-      restoreSessionType();
-    }, 3000);
-  }
-
-  // 恢复期间把网页的音频类型设成 playback，让系统按“音乐播放”处理并重新激活会话；结束后改回原值
-  function setSessionType(type) {
-    var as = navigator.audioSession;
-    if (!as || typeof as.type === 'undefined') return;
-    try {
-      if (state.savedSessionType === null) state.savedSessionType = as.type;
-      if (as.type !== type) { as.type = type; log('audioSession.type = ' + as.type); }
-    } catch (e) { log('audioSession.type not writable'); }
-  }
-
-  function restoreSessionType() {
-    var as = navigator.audioSession;
-    if (!as || state.savedSessionType === null) return;
-    try {
-      if (as.type !== state.savedSessionType) { as.type = state.savedSessionType; log('audioSession.type = ' + as.type + ' (restored)'); }
-    } catch (e) {}
-    state.savedSessionType = null;
-  }
-
   function stopAudioRecovery(msg) {
     if (state.recoverTimer) { clearInterval(state.recoverTimer); state.recoverTimer = null; }
     state.recoverUntil = 0;
-    if (msg) { log('audio recovery ' + msg); restoreSessionType(); }
+    if (msg) log('audio recovery ' + msg);
   }
 
   // 恢复播放：通过 YT Music 自己的 playVideo，播放器界面和状态才会同步（否则它可能马上又暂停）
@@ -1137,13 +1087,7 @@ const magicScript = `
       var p = getPlayer();
       var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
       try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
-      if (isBackground()) {
-        var vv = state.video, tStart = vv ? vv.currentTime : 0;
-        setTimeout(function () {
-          if (vv) log('progress 3s after system resume: +' + (vv.currentTime - tStart).toFixed(1) + 's (' + (vv.paused ? 'paused' : 'playing') + ')');
-        }, 3000);
-        startAudioRecovery('system resume');
-      }
+      if (isBackground()) startAudioRecovery('system resume');
     }
     if (!state.playingSince) state.playingSince = Date.now();
     state.transitionUntil = 0;
@@ -1173,7 +1117,6 @@ const magicScript = `
     state.lastMediaEventAt = Date.now();
     if (!video || video.ended || isNearEnd(video)) { log('pause: track end'); applyKeepAlivePolicy('track end'); return; }  // 一首播完，交给 YT Music 切歌
     if (state.inAd) { log('pause: ad'); return; }
-    if (state.expectNudgePause) { state.expectNudgePause = false; log('pause: restart player'); return; }
     if (Date.now() < state.transitionUntil) { log('pause: transition'); return; }
     if (state.userPaused || state.interrupted) {
       log('pause: ' + (state.interrupted ? 'while interrupted' : 'user paused (' + state.userPausedReason + ')'));

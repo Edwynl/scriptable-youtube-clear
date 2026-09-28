@@ -215,6 +215,15 @@ const SCENARIOS = [
       // 接回后保活音频会按规则关掉（音乐自己占着会话），所以看“接回声音”的记录 + 音乐仍在播
       const restored = (w.__ytClearScriptableMusic.logs || []).some(l => l.indexOf('audio restored') >= 0);
       return mid + '→' + (restored && !v.paused ? '有声' : '无声'); } },
+  { name: '声音接回来后重启播放器（暂停再播放），且不被当成新的打断', expect: '已重启，播放中', run: async (w, v) => {
+      A.blur(w); w.__fakeHidden = true; w.document.dispatchEvent(new w.Event('visibilitychange'));
+      await sleep(6000);
+      A.sysPause(w, v); await sleep(2500);
+      w.__blockResume = true; A.sysPlay(w, v); await sleep(1500);
+      w.__blockResume = false; await sleep(2500);
+      const s = w.__ytClearScriptableMusic.state, logs = w.__ytClearScriptableMusic.logs;
+      const restarted = logs.some(l => l.indexOf('restart player') >= 0);
+      return (restarted ? '已重启' : '未重启') + '，' + (s.interrupted ? '误判打断' : (v.paused ? '暂停' : '播放中')); } },
   { name: '点列表里的歌曲链接，不会再被补点一次', expect: '1 次', run: async (w, v) => {
       const item = w.document.createElement('ytmusic-responsive-list-item-renderer');
       item.innerHTML = '<a href="/watch?v=abc"><span class="t">歌</span></a>';
