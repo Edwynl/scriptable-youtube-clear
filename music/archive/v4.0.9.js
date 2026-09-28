@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.10-scriptable';
+const VERSION = '4.0.9-scriptable';
 
 // 关闭脚本后弹窗显示日志、可一键复制（排查问题用；不需要时改成 false）
 const SHOW_LOG_ON_CLOSE = true;
@@ -144,9 +144,6 @@ const magicScript = `
 
     lastTapPoint: null,
     touchMoved: false,         // 这次触摸有没有滑动（滑动松手不算点击，不补点）
-    ignorePlayEvents: 0,       // 手势“授权”时自己 play() / pause() 产生的事件，忽略
-    ignorePauseEvents: 0,
-    ignoreBlessUntil: 0,
     lastMediaEventAt: 0,       // 最近一次播放 / 暂停 / 切歌事件（判断点击有没有生效）
     lastPromptScan: 0,
     lastDialogCheck: 0,
@@ -687,36 +684,25 @@ const magicScript = `
      从链接点歌时 YT Music 是异步开始播放的，不算手势 → 第一次在控制中心暂停后，“正在播放”
      就退回成系统“音乐”App，点播放没反应；在 App 里亲手点过一次播放后才正常。
      所以在用户的点击里，对“正在播放”的媒体调一次 play()（本来就在放，不影响声音）。 */
-  // 必须在点击的同一时刻同步调用：v4.0.9 用定时器（1 秒内）补，真机证明不算数
   function blessMediaInGesture() {
     var v = state.video || findVideo();
-    if (!v || v.__ytClearBlessed === VERSION) return;   // 每个播放器元素只需要一次
-    var wasPaused = v.paused || v.ended;
-    try {
-      if (!wasPaused) {
-        // 本来就在放：再 play() 一次，不影响声音
-        var p = NATIVE.play.call(v);
-        if (p && p.catch) p.catch(function () {});
-      } else {
-        // 还没开始播（比如刚点歌，YT Music 稍后才异步开始）：play() 再立刻 pause()，
-        // 同一时刻完成，不会出声，只为让 WebKit 记下“用户手势播放过”；这对事件脚本自己忽略
-        state.ignorePlayEvents = 2;     // play + playing（可能不会有 playing）
-        state.ignorePauseEvents = 1;
-        state.ignoreBlessUntil = Date.now() + 1000;
-        var p2 = NATIVE.play.call(v);
-        if (p2 && p2.catch) p2.catch(function () {});
-        NATIVE.pause.call(v);
-      }
-    } catch (e) { return; }
-    v.__ytClearBlessed = VERSION;
-    log('media blessed in user gesture (' + (wasPaused ? 'play+pause' : 'play') + ') - keeps lock screen / Control Center after pause');
+    if (v && !v.paused && !v.ended) { blessMedia(v); return; }
+    // 刚点了歌、还没开始播：WebKit 会把手势延续到 1 秒内的定时器里
+    setTimeout(function () {
+      var v2 = state.video || findVideo();
+      if (v2 && !v2.paused && !v2.ended) blessMedia(v2);
+    }, 900);
   }
 
-  function isBlessEvent(kind) {
-    if (Date.now() > state.ignoreBlessUntil) { state.ignorePlayEvents = 0; state.ignorePauseEvents = 0; return false; }
-    if (kind === 'play' && state.ignorePlayEvents > 0) { state.ignorePlayEvents--; return true; }
-    if (kind === 'pause' && state.ignorePauseEvents > 0) { state.ignorePauseEvents--; return true; }
-    return false;
+  function blessMedia(v) {
+    try {
+      var p = NATIVE.play.call(v);
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) { return; }
+    if (v.__ytClearBlessed !== VERSION) {
+      v.__ytClearBlessed = VERSION;
+      log('media blessed in user gesture (keeps lock screen / Control Center after pause)');
+    }
   }
 
   /* ══════════════════════════════════════════════════════════
@@ -1195,8 +1181,7 @@ const magicScript = `
     applyKeepAlivePolicy('presentation');
   }
 
-  function onVideoPlaying(event) {
-    if (isBlessEvent('play')) return;
+  function onVideoPlaying() {
     log('playing');
     state.lastMediaEventAt = Date.now();
     if (state.interrupted) {
@@ -1239,7 +1224,6 @@ const magicScript = `
 
   /* ─── 暂停事件：所有暂停都会到这里（包括系统造成的） ─── */
   function onVideoPause(event) {
-    if (isBlessEvent('pause')) return;
     var video = (event && event.target) || getVideo();
     state.playingSince = 0;
     state.lastMediaEventAt = Date.now();

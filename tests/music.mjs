@@ -276,13 +276,14 @@ const SCENARIOS = [
       touch(w, w.document.body, 200, 300); await sleep(300);
       const logs = w.__ytClearScriptableMusic.logs;
       return (w.__plays > p0 && logs.some(l => l.indexOf('media blessed') >= 0) ? '已补' : '未补') + '，' + (v.paused ? '暂停了' : '仍在播'); } },
-  { name: '点歌后 1 秒内才开始播放，也在同一次点击里补上', expect: '已补', run: async (w, v) => {
+  { name: '点歌那一刻（还没开始播）就同步补上，不出声、不打乱状态', expect: '同步已补，仍暂停→播放', run: async (w, v) => {
       A.touch(w); A.pagePause(w, v); await sleep(1500);      // 先处于暂停
-      w.__ytClearScriptableMusic.logs.length = 0;
+      const logs = w.__ytClearScriptableMusic.logs; logs.length = 0;
       touch(w, w.document.body, 200, 300);                   // 点歌
-      await sleep(400); A.sysPlay(w, v);                     // YT Music 异步开始播放
-      await sleep(900);
-      return w.__ytClearScriptableMusic.logs.some(l => l.indexOf('media blessed') >= 0) ? '已补' : '未补'; } },
+      const syncBlessed = logs.some(l => l.indexOf('media blessed') >= 0);   // 同一时刻就要完成
+      await sleep(300); const mid = v.paused ? '仍暂停' : '响了';
+      A.sysPlay(w, v); await sleep(600);                     // YT Music 异步开始播放
+      return (syncBlessed ? '同步已补' : '未同步') + '，' + mid + '→' + st(v); } },
   { name: '暂停时点屏幕，音乐不会自己响起来', expect: '仍暂停', run: async (w, v) => {
       A.touch(w); A.pagePause(w, v); await sleep(1500);
       touch(w, w.document.body, 200, 300); await sleep(1500);
