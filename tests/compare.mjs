@@ -55,6 +55,7 @@ async function makePage(code, url = 'https://m.youtube.com/watch?v=test', before
     };
     // iOS 原生控件 / 系统造成的暂停：直接走原生 pause，不经过网页 JS
     window.__sysPause = P.pause;
+    window.__sysPlay = P.play;     // 画中画小窗上的播放键：系统控件，不经过网页 JS
     window.__origPlay = P.play;
     window.__origAdd = EventTarget.prototype.addEventListener;
     HTMLVideoElement.prototype.webkitEnterFullscreen = function () {
@@ -110,6 +111,7 @@ const A = {
   pipBackInline: (w, v) => { v.webkitPresentationMode = 'inline'; v.dispatchEvent(new w.Event('webkitpresentationmodechanged')); },
   portrait: w => { w.__vw = 430; w.__vh = 932; w.dispatchEvent(new w.Event('resize')); },
   sysPause:(w, v) => w.__sysPause.call(v),
+  sysPlay: (w, v) => w.__sysPlay.call(v),
   userPlay:(w, v) => w.HTMLMediaElement.prototype.play.call(v),
   landscape: w => { w.__vw = 932; w.__vh = 430; w.dispatchEvent(new w.Event('resize')); },
 };
@@ -271,6 +273,20 @@ const SCENARIOS = [
       A.blur(w); await sleep(2000);                                   // 只有 blur，没有 hidden
       const r = await interruptFor(w, v, 2500);
       return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次'; } },
+  { group: '被打断', name: '真机日志复现：画中画第二条语音，YouTube 约 1 秒后自己 play()', expect: '暂停→暂停→播放', run: async (w, v) => {
+      // Scriptable 里画中画时页面读不到后台状态（hidden 一直是 false），音频会话也没被标记打断
+      A.toPiP(w, v, false); await sleep(2500);
+      A.sysPause(w, v); await sleep(900);
+      w.HTMLMediaElement.prototype.play.call(v); await sleep(500);    // YouTube 自己恢复
+      const a = state(v);
+      w.HTMLMediaElement.prototype.play.call(v); await sleep(1500);   // 再试一次
+      const b = state(v);
+      A.sysPlay(w, v); await sleep(500);                               // 语音听完，用户点小窗的播放
+      return a + '→' + b + '→' + state(v); } },
+  { group: '画中画', name: '画中画里点暂停，YouTube 不能自己恢复', expect: '暂停', run: async (w, v) => {
+      A.toPiP(w, v, false); await sleep(2500);
+      A.sysPause(w, v); await sleep(900); w.HTMLMediaElement.prototype.play.call(v); await sleep(1000);
+      return state(v); } },
   { group: '被打断', name: '后台拔耳机（没有打断信号）：保持暂停', expect: '暂停', run: async (w, v) => {
       A.lock(w); await sleep(2000); A.sysPause(w, v); await sleep(2500); return state(v); } },
   { group: '其他', name: '首页横屏不全屏（预览视频）', url: 'https://m.youtube.com/', expect: '0 次', run: async (w, v) => {

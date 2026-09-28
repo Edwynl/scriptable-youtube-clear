@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.8.3-scriptable';
+const VERSION = '1.8.2-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -140,9 +140,7 @@ const magicScript = `
     interrupted: false,        // 音频被别的 App 打断中（微信语音、来电、Siri……）
     interruptedAt: 0,
     resumeAfterInterruption: false,
-    userPausedReason: '',
-    pipYield: false,           // 画中画里被网页外部暂停（微信语音 / 小窗暂停键）：只有用户亲手播放才继续
-    pipYieldLogged: false,             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
+    userPausedReason: '',             // 最近一次 window 级 blur（上滑回主屏幕、拉控制中心时都会有）
 
     debugTaps: [],
     logs: []
@@ -678,7 +676,6 @@ const magicScript = `
     log('interruption ended: ' + reason);
     if (state.resumeAfterInterruption && !state.userPaused) {
       state.resumeAfterInterruption = false;
-      state.pipYield = false;      // 真正的打断结束（语音播完）→ 可以继续
       clearUserPaused();
       softResume(600);
       softResume(1500);
@@ -786,7 +783,6 @@ const magicScript = `
     state.realBackgrounded = false;
     state.hiddenSince = 0;
     state.bgSince = 0;
-    state.pipYield = false;
     endInterruption('back to app');
     if (!state.userPaused) startAudioKeepAlive();
     rebindMediaSession();
@@ -903,11 +899,7 @@ const magicScript = `
           log('page play() blocked (interrupted)');
           return Promise.resolve();
         }
-        if (isInPiP(this) && state.pipYield && !recentGesture() && Date.now() >= state.transitionUntil) {
-          if (!state.pipYieldLogged) { log('page play() blocked (PiP paused outside page)'); state.pipYieldLogged = true; }
-          return Promise.resolve();
-        }
-        if (hidden || isInPiP(this)) log('page play()' + (isInPiP(this) ? ' in PiP' : ' in background'));
+        if (hidden) log('page play() in background');
         clearUserPaused();
         startAudioKeepAlive();   // 在用户手势的调用栈里启动，iOS 才允许
       }
@@ -1035,7 +1027,6 @@ const magicScript = `
       }
     } else if (state.pipSince) {
       state.pipSince = 0;
-      state.pipYield = false;
       state.lastPipEndAt = Date.now();
     }
   }
@@ -1063,7 +1054,6 @@ const magicScript = `
 
   function onVideoPlaying() {
     log('playing');
-    state.pipYield = false;
     if (state.interrupted) { state.interrupted = false; state.resumeAfterInterruption = false; log('interruption ended: playing'); }
     state.transitionUntil = 0;
     clearUserPaused();
@@ -1100,10 +1090,8 @@ const magicScript = `
           if (state.shouldResume) { syncResume(); softResume(150); softResume(700); }
           return;
         }
-        // 画中画里被暂停（小窗暂停键、微信语音……）：让出播放，不许 YouTube 自己恢复
-        state.pipYield = true;
-        state.pipYieldLogged = false;
         if (state.interrupted) { updateMediaSession(); return; }
+        // 之后画中画里的暂停，是用户点了小窗上的按钮（如果随后发现是音频被打断，会再改回来）
         setUserPaused('picture-in-picture');
         updateMediaSession();
         return;
@@ -1159,7 +1147,7 @@ const magicScript = `
 
   function syncResume() {
     var video = state.video || getVideo();
-    if (!video || state.userPaused || state.inAd || state.interrupted || state.pipYield) return;
+    if (!video || state.userPaused || state.inAd || state.interrupted) return;
     if (!video.paused || video.ended) return;
     try {
       var promise = NATIVE.play.call(video);
@@ -1204,7 +1192,7 @@ const magicScript = `
   function softResume(delay) {
     setTimeout(function () {
       var video = getVideo();
-      if (!video || state.userPaused || state.inAd || state.interrupted || state.pipYield) return;
+      if (!video || state.userPaused || state.inAd || state.interrupted) return;
       if (Date.now() < state.transitionUntil) return;
       if (video.paused && !video.ended) attemptPlay(video);
       updateMediaSession();
@@ -1236,7 +1224,6 @@ const magicScript = `
 
     setMediaAction('play', function () {
       log('ms play');
-      state.pipYield = false;
       state.interrupted = false;
       state.resumeAfterInterruption = false;
       clearUserPaused();
@@ -1730,7 +1717,6 @@ const magicScript = `
       '  inAd=' + state.inAd +
       '  keepAlive=' + !!state.keepAliveOsc +
       '  interrupted=' + state.interrupted +
-      '  pipYield=' + state.pipYield +
       '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') + '\\n' +
       state.logs.slice(-400).join('\\n');
     document.body.appendChild(panel);
