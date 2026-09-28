@@ -260,6 +260,17 @@ const SCENARIOS = [
       const r = await interruptFor(w, v, 2000);
       setAudio(w, 'running'); await sleep(2000);
       return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次→' + state(v); } },
+  { group: '被打断', name: '微信语音期间 YouTube 自己调用 play()', expect: '暂停→播放', run: async (w, v) => {
+      A.lock(w); await sleep(2000);
+      A.sysPause(w, v); await sleep(100); setAudio(w, 'interrupted'); await sleep(300);
+      w.HTMLMediaElement.prototype.play.call(v); await sleep(800);     // YouTube 播放器自己恢复
+      const mid = state(v);
+      setAudio(w, 'running'); await sleep(2000);
+      return mid + '→' + state(v); } },
+  { group: '被打断', name: '读不到页面隐藏状态时，微信语音期间不抢', expect: '暂停，抢 0 次', run: async (w, v) => {
+      A.blur(w); await sleep(2000);                                   // 只有 blur，没有 hidden
+      const r = await interruptFor(w, v, 2500);
+      return (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次'; } },
   { group: '被打断', name: '后台拔耳机（没有打断信号）：保持暂停', expect: '暂停', run: async (w, v) => {
       A.lock(w); await sleep(2000); A.sysPause(w, v); await sleep(2500); return state(v); } },
   { group: '其他', name: '首页横屏不全屏（预览视频）', url: 'https://m.youtube.com/', expect: '0 次', run: async (w, v) => {

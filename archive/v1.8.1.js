@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: play-circle;
 
-const VERSION = '1.8.2-scriptable';
+const VERSION = '1.8.1-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -136,7 +136,6 @@ const magicScript = `
     lastBlurAt: 0,
 
     hiddenSince: 0,            // 页面真正进入后台的时间
-    bgSince: 0,                // 第一次收到后台事件的时间（hidden 读不到时的后备）
     interrupted: false,        // 音频被别的 App 打断中（微信语音、来电、Siri……）
     interruptedAt: 0,
     resumeAfterInterruption: false,
@@ -150,7 +149,7 @@ const magicScript = `
     try {
       var t = new Date();
       state.logs.push(t.toTimeString().slice(0, 8) + '.' + ('00' + t.getMilliseconds()).slice(-3) + ' ' + message);
-      if (state.logs.length > 800) state.logs.splice(0, 200);
+      if (state.logs.length > 300) state.logs.splice(0, 100);
     } catch (e) {}
   }
 
@@ -572,24 +571,14 @@ const magicScript = `
   }
 
   /* ─── 侧边面板（只负责创建；横竖屏交给 CSS） ─── */
-  function makePanelButton(svg, label, onTap, onLongPress) {
+  function makePanelButton(svg, label, onTap) {
     var b = document.createElement('div');
     b.className = 'yt-pb';
     b.innerHTML = svg;
     b.setAttribute('role', 'button');          // 旁白（VoiceOver）可读
     b.setAttribute('aria-label', label);
-    var pressTimer = null;
-    var longPressed = false;
-    b.addEventListener('touchstart', function () {
-      longPressed = false;
-      if (!onLongPress) return;
-      pressTimer = setTimeout(function () { longPressed = true; onLongPress(); }, 700);
-    }, { passive: true });
-    b.addEventListener('touchmove', function () { clearTimeout(pressTimer); }, { passive: true });
     b.addEventListener('touchend', function (e) {
-      clearTimeout(pressTimer);
-      e.preventDefault(); e.stopPropagation();
-      if (!longPressed) onTap();
+      e.preventDefault(); e.stopPropagation(); onTap();
     }, { passive: false });
     return b;
   }
@@ -609,7 +598,7 @@ const magicScript = `
       panel.id = 'yt-panel';
       panel.appendChild(makePanelButton(SVG.search, I18N.search, doSearch));
       panel.appendChild(makePanelButton(SVG.back, I18N.back, function () { window.history.back(); }));
-      panel.appendChild(makePanelButton(SVG.home, I18N.home, goHome, toggleDebugOverlay));   // 长按首页键：调试面板
+      panel.appendChild(makePanelButton(SVG.home, I18N.home, goHome));
       root.appendChild(panel);
     } else if (panel.parentNode !== root) {
       root.appendChild(panel);
@@ -750,7 +739,6 @@ const magicScript = `
       ' mode=' + ((bgVideo && bgVideo.webkitPresentationMode) || 'inline') +
       (bgVideo && !bgVideo.paused ? ' playing' : ' paused'));
     state.realBackgrounded = true;
-    if (!state.bgSince) state.bgSince = Date.now();
     if (hardBg && !state.hiddenSince) state.hiddenSince = Date.now();
 
     // 刚被当作暂停的前台暂停，其实是切后台造成的 → 撤销
@@ -782,7 +770,6 @@ const magicScript = `
     log('fg' + (event && event.type ? ' ' + event.type : ''));
     state.realBackgrounded = false;
     state.hiddenSince = 0;
-    state.bgSince = 0;
     endInterruption('back to app');
     if (!state.userPaused) startAudioKeepAlive();
     rebindMediaSession();
@@ -893,13 +880,6 @@ const magicScript = `
   function patchMedia() {
     HTMLMediaElement.prototype.play = function () {
       if (this && this.tagName === 'VIDEO') {
-        var hidden = isReallyHidden() || state.realBackgrounded;
-        // 被微信语音 / 来电打断期间，YouTube 自己调 play() 会把声音抢回来 → 拦截
-        if (state.interrupted && hidden && !recentGesture() && Date.now() >= state.transitionUntil) {
-          log('page play() blocked (interrupted)');
-          return Promise.resolve();
-        }
-        if (hidden) log('page play() in background');
         clearUserPaused();
         startAudioKeepAlive();   // 在用户手势的调用栈里启动，iOS 才允许
       }
@@ -1110,8 +1090,7 @@ const magicScript = `
 
     // 3) 已在后台一段时间后才出现的暂停：不是切后台造成的，而是被别的 App 打断
     //    （微信语音、来电、Siri）→ 让出声音，不去抢
-    var bgStart = state.hiddenSince || state.bgSince;
-    if (state.interrupted || (bgStart && Date.now() - bgStart > BG_SETTLED)) {
+    if (state.interrupted || (state.hiddenSince && Date.now() - state.hiddenSince > BG_SETTLED)) {
       beginInterruption('pause in background');
       updateMediaSession();
       return;
@@ -1167,7 +1146,6 @@ const magicScript = `
   }
 
   function attemptPlay(video) {
-    if (isReallyHidden() || state.realBackgrounded) log('resume attempt (background)');
     var promise;
     try { promise = NATIVE.play.call(video); } catch (e) { return; }
     if (!promise || !promise.catch) return;
@@ -1681,34 +1659,8 @@ const magicScript = `
     var v = getVideo();
     var panel = document.createElement('div');
     panel.id = 'ytm-debug-overlay';
-    panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:60%;overflow:auto;background:rgba(0,0,0,0.94);color:#7CFC00;font:10px/1.5 monospace;z-index:2147483647;padding:10px;white-space:pre-wrap;-webkit-overflow-scrolling:touch;';
-
-    var bar = document.createElement('div');
-    bar.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;position:sticky;top:0;';
-    function btn(text, fn) {
-      var x = document.createElement('button');
-      x.textContent = text;
-      x.style.cssText = 'flex:1;padding:8px;border:none;border-radius:8px;background:#333;color:#fff;font-size:13px;';
-      x.addEventListener('touchend', function (e) { e.preventDefault(); e.stopPropagation(); fn(x); }, { passive: false });
-      return x;
-    }
-    bar.appendChild(btn('复制日志', function (x) {
-      var text = pre.textContent;
-      function done(ok) { x.textContent = ok ? '已复制' : '复制失败，请截图'; }
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
-          return;
-        }
-      } catch (e) {}
-      done(false);
-    }));
-    bar.appendChild(btn('关闭', function () { if (panel.parentNode) panel.parentNode.removeChild(panel); }));
-    panel.appendChild(bar);
-
-    var pre = document.createElement('div');
-    panel.appendChild(pre);
-    pre.textContent = 'v' + VERSION +
+    panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:55%;overflow:auto;background:rgba(0,0,0,0.92);color:#7CFC00;font:10px/1.5 monospace;z-index:2147483647;padding:10px;white-space:pre-wrap;-webkit-overflow-scrolling:touch;';
+    panel.textContent = 'v' + VERSION +
       '  mode=' + ((v && v.webkitPresentationMode) || 'inline') +
       '  pip=' + (pipSupported(v) ? 'yes' : 'no') +
       '  hidden=' + isReallyHidden() +
@@ -1718,7 +1670,7 @@ const magicScript = `
       '  keepAlive=' + !!state.keepAliveOsc +
       '  interrupted=' + state.interrupted +
       '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') + '\\n' +
-      state.logs.slice(-400).join('\\n');
+      state.logs.slice(-150).join('\\n');
     document.body.appendChild(panel);
   }
 
@@ -1802,7 +1754,7 @@ const magicScript = `
 
   listen(document, 'touchstart', markGesture, { passive: true });
   listen(document, 'touchend', markGesture, { passive: true });
-  listen(window, 'touchend', onDebugTap, { capture: true, passive: true });
+  listen(document, 'touchend', onDebugTap, { passive: true });
   listen(document, 'click', markGesture, true);
   listen(document, 'keydown', markGesture, true);
   listen(window, 'popstate', onNavigate);
@@ -1838,19 +1790,6 @@ const reinjectTimer = Timer.schedule(3000, true, async () => {
 
 await webView.present(true);
 reinjectTimer.invalidate();
-
-// 关闭后把本次日志存到 Scriptable 文件夹（文件 App → iCloud 云盘 / 我的 iPhone → Scriptable → yt-clear-log.txt）
-try {
-  const logText = await webView.evaluateJavaScript(
-    "(function(){var t=window.__ytClearScriptableTube;return t&&t.logs?t.logs.join('\\n'):'';})()"
-  );
-  if (logText) {
-    let fm;
-    try { fm = FileManager.iCloud(); } catch (e) { fm = FileManager.local(); }
-    fm.writeString(fm.joinPath(fm.documentsDirectory(), 'yt-clear-log.txt'),
-      'v' + VERSION + '  ' + new Date().toString() + '\n' + logText);
-  }
-} catch (e) {}
 Script.complete();
 
 }
