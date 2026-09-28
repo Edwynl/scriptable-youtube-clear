@@ -71,6 +71,8 @@ async function makePage(code) {
       window.__ctxs.push(et);
       return et;
     };
+    // 模拟 iOS 的 navigator.audioSession：被别的 App 打断时 state 为 interrupted
+    navigator.audioSession = (function () { var et = new EventTarget(); et.type = 'auto'; et.state = 'active'; return et; })();
     window.__handlers = {};
     navigator.mediaSession = { setActionHandler(n, f){ window.__handlers[n] = f; }, setPositionState(){}, playbackState: 'none' };
 
@@ -106,6 +108,7 @@ async function interruptFor(w, v, ms, withCtx) {
   await sleep(ms);
   return { grabbed: (c ? c.__resumeCalls - r0 : 0) + (w.__plays - p0), paused: v.paused };
 }
+const setSession = (w, s) => { w.navigator.audioSession.state = s; w.navigator.audioSession.dispatchEvent(new w.Event('statechange')); };
 const grabText = r => (r.paused ? '暂停' : '播放') + '，抢 ' + r.grabbed + ' 次';
 
 const SCENARIOS = [
@@ -150,6 +153,19 @@ const SCENARIOS = [
       v.__t = 199.5; A.sysPause(w, v); await sleep(100);
       v.dispatchEvent(new w.Event('loadstart')); v.__t = 0; await sleep(100); A.pagePlay(w, v); await sleep(1500); return st(v); } },
 
+  { name: '微信语音结束（音频会话交还）后自动继续播放', expect: '暂停→播放', run: async (w, v) => {
+      A.blur(w); await sleep(6000);
+      A.sysPause(w, v); await sleep(50); setSession(w, 'interrupted');   // 打断期间一直是 interrupted
+      await sleep(5000); const mid = st(v);
+      setSession(w, 'inactive'); await sleep(2000);                        // 语音放完，交还声音（规范：结束后变 inactive）
+      return mid + '→' + st(v); } },
+  { name: '来电挂断恢复后，YT Music 立刻自己 pause() 不会再停掉', expect: '播放', run: async (w, v) => {
+      await interruptFor(w, v, 1500, true); setAudio(w, 'running'); await sleep(300);
+      A.pagePause(w, v); await sleep(1500); return st(v); } },
+  { name: '打断期间记录心跳日志（判断 App 是否被挂起）', expect: '有', run: async (w, v) => {
+      A.blur(w); await sleep(2500); A.sysPause(w, v); await sleep(4800);
+      const logs = (w.__ytClearScriptableMusic && w.__ytClearScriptableMusic.logs) || [];
+      return logs.some(l => l.indexOf('still interrupted') >= 0) ? '有' : '无'; } },
   { name: '锁屏“下一首”只切一首', expect: '1 次', run: async (w, v) => {
       let n = 0; w.document.querySelector('.next-button').addEventListener('click', () => n++);
       await sleep(300); w.__handlers.nexttrack && w.__handlers.nexttrack(); await sleep(300); return n + ' 次'; } },

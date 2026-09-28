@@ -2,7 +2,7 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: music;
 
-const VERSION = '4.0.1-scriptable';
+const VERSION = '4.0.0-scriptable';
 
 if (!config.runsInApp) {
   const alert = new Alert();
@@ -77,8 +77,6 @@ const magicScript = `
   var KEEPALIVE_PLAYING_OFF = 1500;          // 后台稳定播放这么久后，停掉保活音频
   var KEEPALIVE_IDLE_STOP = 10 * 60 * 1000;  // 用户暂停超过 10 分钟，停掉保活音频省电
   var TAP_FALLBACK_DELAY = 450;              // 点了列表项多久没反应，才补点一次
-  var INTERRUPT_BEAT = 4000;                 // 打断期间多久记一次心跳 / 检查一次是否结束
-  var RESUME_PROTECT = 3000;                 // 打断结束恢复播放后，这么久内不让 YT Music 自己再暂停
 
   var state = {
     loopTimer: null,
@@ -123,9 +121,6 @@ const magicScript = `
     resumeAfterInterruption: false,
     playBlockLogged: false,
     playingSince: 0,           // 这一段连续播放开始的时间
-    interruptBeat: null,
-    sessionState: '',          // navigator.audioSession 上一次的状态
-    protectPlayUntil: 0,
 
     mediaSessionBound: false,
     lastMediaSessionRefresh: 0,
@@ -304,79 +299,20 @@ const magicScript = `
         state.userPaused = false;
         state.resumeAfterInterruption = true;
       }
-      log('interrupted: ' + reason + (state.resumeAfterInterruption ? ' (will resume)' : '') +
-        ' [audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ' session=' + (audioSessionState() || '-') + ']');
-      startInterruptBeat();
+      log('interrupted: ' + reason + (state.resumeAfterInterruption ? ' (will resume)' : ''));
     }
     state.shouldResume = false;
     applyKeepAlivePolicy('interrupted');
   }
 
-  // 打断期间定时记一行心跳：从日志能看出 App 在语音期间有没有被 iOS 挂起；
-  // 同时检查音频会话是否已经不再“被打断”（以防状态变化事件漏发）
-  function startInterruptBeat() {
-    stopInterruptBeat();
-    state.interruptBeat = setInterval(function () {
-      if (!state.interrupted) { stopInterruptBeat(); return; }
-      var v = state.video;
-      var sess = audioSessionState();
-      log('still interrupted ' + Math.round((Date.now() - state.interruptedAt) / 1000) + 's' +
-        ' [audio=' + (state.audioCtx ? state.audioCtx.state : '-') + ' session=' + (sess || '-') +
-        ' video=' + (v && !v.paused ? 'playing' : 'paused') + ']');
-      if (state.sessionState === 'interrupted' && sess && sess !== 'interrupted') {
-        state.sessionState = sess;
-        endInterruption('audioSession ' + sess + ' (poll)');
-      }
-    }, INTERRUPT_BEAT);
-  }
-
-  function stopInterruptBeat() {
-    if (state.interruptBeat) { clearInterval(state.interruptBeat); state.interruptBeat = null; }
-  }
-
-  /* ─── iOS 的音频会话状态（Safari / WKWebView 支持时）───
-     被别的 App 打断时是 interrupted，对方放完、交还声音后离开 interrupted —— 这是“语音结束”最直接的信号 */
-  function audioSessionState() {
-    try { return navigator.audioSession ? String(navigator.audioSession.state || '') : ''; } catch (e) { return ''; }
-  }
-
-  function watchAudioSession() {
-    var as = navigator.audioSession;
-    if (!as) { log('audioSession: not supported'); return; }
-    state.sessionState = audioSessionState();
-    log('audioSession: type=' + as.type + ' state=' + state.sessionState);
-    try { listen(as, 'statechange', onAudioSessionChange); } catch (e) { log('audioSession: no statechange'); }
-  }
-
-  function onAudioSessionChange() {
-    var prev = state.sessionState;
-    var now = audioSessionState();
-    state.sessionState = now;
-    log('audioSession ' + prev + ' -> ' + now);
-    if (now === 'interrupted') beginInterruption('audioSession');
-    // 只认“从 interrupted 离开”才是结束；刚被打断时会话变成 inactive 不算
-    else if (prev === 'interrupted' && state.interrupted) endInterruption('audioSession ' + now);
-  }
-
-  // 恢复播放：通过 YT Music 自己的 playVideo，播放器界面和状态才会同步（否则它可能马上又暂停）
-  function resumeAfterInterruptionNow(reason) {
-    var p = getPlayer();
-    var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
-    log('resume after interruption (' + reason + ')');
-    state.protectPlayUntil = Date.now() + RESUME_PROTECT;
-    try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
-    softResume(400);
-    softResume(1200);
-  }
-
   function endInterruption(reason) {
     if (!state.interrupted) return;
     state.interrupted = false;
-    stopInterruptBeat();
     log('interruption ended: ' + reason);
     if (state.resumeAfterInterruption && !state.userPaused) {
       clearUserPaused();
-      resumeAfterInterruptionNow(reason);
+      softResume(600);
+      softResume(1500);
     }
     state.resumeAfterInterruption = false;
   }
@@ -520,10 +456,6 @@ const magicScript = `
       return true;
     }
     if (now < state.transitionUntil) return true;
-    if (now < state.protectPlayUntil && !state.userPaused && !state.interrupted) {
-      log(source + ' blocked (just resumed after interruption)');
-      return false;
-    }
     if (state.interrupted || state.userPaused || !state.shouldResume) return true;
     if (inNativePlayer(el || state.video || findVideo())) {
       log(source + ' blocked (native player)');
@@ -999,13 +931,7 @@ const magicScript = `
     if (state.interrupted) {
       state.interrupted = false;
       state.resumeAfterInterruption = false;
-      stopInterruptBeat();
-      log('interruption ended: playing (resumed by system)');
-      // 系统自己恢复了播放：同步 YT Music 的状态，并防止它随即又暂停
-      state.protectPlayUntil = Date.now() + RESUME_PROTECT;
-      var p = getPlayer();
-      var nativePlayVideo = p && (p.__ytClearNative_playVideo || p.playVideo);
-      try { if (nativePlayVideo) nativePlayVideo.call(p); } catch (e) {}
+      log('interruption ended: playing');
     }
     if (!state.playingSince) state.playingSince = Date.now();
     state.transitionUntil = 0;
@@ -1182,7 +1108,6 @@ const magicScript = `
 
     setMediaAction('play', function () {
       log('ms play');
-      stopInterruptBeat();
       state.interrupted = false;
       state.resumeAfterInterruption = false;
       clearUserPaused();
@@ -1749,7 +1674,6 @@ const magicScript = `
       '  inAd=' + state.inAd +
       '  keepAlive=' + !!state.keepAliveOsc +
       '  audio=' + (state.audioCtx ? state.audioCtx.state : '-') +
-      '  session=' + (audioSessionState() || '-') +
       '  mode=' + ((v && v.webkitPresentationMode) || 'inline') + '\\n' +
       state.logs.slice(-400).join('\\n');
     document.body.appendChild(panel);
@@ -1763,7 +1687,6 @@ const magicScript = `
     if (state.loopTimer) clearTimeout(state.loopTimer);
     if (state.observerTimer) clearTimeout(state.observerTimer);
     if (state.observer) state.observer.disconnect();
-    stopInterruptBeat();
 
     stopAudioKeepAlive();
     if (state.audioCtx) {
@@ -1819,7 +1742,6 @@ const magicScript = `
   patchVisibility();
   patchBackgroundEventRegistration();
   patchMedia();
-  watchAudioSession();
   blockAppRedirects();
   bindMobileTapFix();
   injectCSS();
